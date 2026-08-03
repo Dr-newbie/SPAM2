@@ -49,7 +49,7 @@ SPAM/
 │   └── ...
 ├── utils/           # Utilities
 │   ├── dataset.py          # Dataset & dataloader
-│   ├── graph_construction.py  # KNN graph building
+│   ├── graph_construction.py  # KNN/Delaunay graph building
 │   ├── lora_utils.py       # (Optional) LoRA utilities
 │   ├── loss_util.py        # ZINB loss, contrastive loss, etc.
 │   └── ...
