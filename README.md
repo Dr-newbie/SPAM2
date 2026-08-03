@@ -203,7 +203,8 @@ The jupyter notebook for usage & detailed experiments will update with:
    * Alignment pipelines
    * Gene expression prediction & measurements
    * Downstream task (Cell type clustering)
-   * Gene expression map visualization\n
+   * Gene expression map visualization
+     
 You can check the tutorial notebook in tutorial.ipynb file
 
 
