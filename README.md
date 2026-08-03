@@ -204,7 +204,7 @@ The jupyter notebook for usage & detailed experiments will update with:
    * Gene expression prediction & measurements
    * Downstream task (Cell type clustering)
    * Gene expression map visualization
-Stay tuned for our updates...🙏
+You can check the tutorial notebook in tutorial.ipynb file
 
 
 --- 
