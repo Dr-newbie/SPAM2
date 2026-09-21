@@ -1,5 +1,9 @@
 import torch.nn as nn
 from peft import LoraConfig, get_peft_model, PeftModel
+try:
+    from peft import inject_adapter_in_model
+except ImportError:  # older peft
+    inject_adapter_in_model = None
 
 
 def _collect_lora_targets_for_vit(enc, backbone_name: str):
@@ -46,5 +50,20 @@ def attach_lora_to_foundation(
         target_modules=targets,
         task_type="FEATURE_EXTRACTION",  # 분류/LM이 아니므로
     )
-    foundation.encoder = get_peft_model(enc, cfg)  # 기본적으로 base weight는 freeze, LoRA만 학습
+
+    # get_peft_model() returns a PeftModel whose forward assumes a HuggingFace
+    # signature; calling it on a timm VisionTransformer raises
+    #   TypeError: VisionTransformer.forward() got an unexpected keyword
+    #   argument 'input_ids'
+    # inject_adapter_in_model() adds the same LoRA layers in place and leaves the
+    # module's own forward signature untouched, so it works for timm backbones
+    # (uni_v1, virchow, gigapath, ...) as well as HF ones. It does NOT freeze the
+    # base weights, so do that explicitly: only lora_* params stay trainable.
+    if inject_adapter_in_model is not None:
+        enc = inject_adapter_in_model(cfg, enc)
+        for n, p in enc.named_parameters():
+            p.requires_grad = ("lora_" in n)
+        foundation.encoder = enc
+    else:
+        foundation.encoder = get_peft_model(enc, cfg)
     return foundation

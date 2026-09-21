@@ -84,6 +84,9 @@ def zinb_nll(
     # ✅ 최종 결과 검증
     if torch.isnan(result) or torch.isinf(result):
         print(f"[WARN] zinb_nll returned NaN/Inf: {result.item()}")
-        return torch.tensor(1e6, device=x.device, dtype=x.dtype)
-    
+        # Sanitize in-place on the graph so grad_fn is preserved; returning a fresh
+        # torch.tensor(1e6) would be a leaf with requires_grad=False and make the
+        # subsequent loss.backward() raise "does not require grad".
+        result = torch.nan_to_num(result, nan=1e6, posinf=1e6, neginf=1e6)
+
     return result

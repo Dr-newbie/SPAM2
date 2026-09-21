@@ -143,6 +143,34 @@ def top1_cosine_match(
     return best_idx.cpu().numpy(), best_val.cpu().numpy()
 
 
+def topk_cosine_match(
+    train_rep: np.ndarray,
+    test_rep: np.ndarray,
+    k: int = 10,
+    chunk_size: int = 1024,
+    device: str = "cpu",
+    show_progress: bool = True,
+    desc: str | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Cosine top-K match test->train. Returns (topk_idx [N,K], topk_sim [N,K])."""
+    dev = torch.device(device)
+    train_t = F.normalize(torch.from_numpy(train_rep).to(dev, dtype=torch.float32), dim=1)
+    test_t = F.normalize(torch.from_numpy(test_rep).to(dev, dtype=torch.float32), dim=1)
+    kk = int(min(k, train_t.size(0)))
+    idx = torch.empty(test_t.size(0), kk, dtype=torch.long, device=dev)
+    val = torch.empty(test_t.size(0), kk, dtype=torch.float32, device=dev)
+    steps = range(0, test_t.size(0), chunk_size)
+    if show_progress:
+        steps = tqdm(steps, desc=desc or "topk-similarity", leave=False)
+    for s in steps:
+        e = min(test_t.size(0), s + chunk_size)
+        sims = test_t[s:e] @ train_t.t()
+        v, i = torch.topk(sims, kk, dim=1)
+        idx[s:e] = i
+        val[s:e] = v
+    return idx.cpu().numpy(), val.cpu().numpy()
+
+
 def _expression_matrix_for_spots(adata: ad.AnnData, spot_ids: list[str]) -> np.ndarray:
     obs_to_pos = {str(s): i for i, s in enumerate(adata.obs_names.astype(str).tolist())}
     idxs = [obs_to_pos[str(s)] for s in spot_ids]

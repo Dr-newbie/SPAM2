@@ -1,5 +1,20 @@
-# run_contrastive2.py
-# Cross-attention fusion before contrastive (image↔gene, image↔coord)
+# run_contrastive_xattn.py
+# Stage 1: multi-branch contrastive pretraining (manuscript Eqs. 1-6).
+#
+# NOTE ON THE FILENAME: this script no longer trains any cross-attention. Per
+# Fig. 1 and Eqs. (4)-(6) the pretraining objective is plain InfoNCE between the
+# ENCODER OUTPUTS; cross-attention is the finetuning fusion of Eq. (8). The
+# "_xattn" suffix is kept only so existing commands keep resolving.
+#
+# Spatial branch:
+#   - graph edges E     : Delaunay triangulation over the cell centroids  (Eq. 1)
+#   - node features H(0): the histology embedding of each cell            (Eq. 2)
+#   Coordinates build E only; they are never GCN node features.
+#
+# Checkpoints written to --save_dir:
+#   Image_pretrained.pt    image encoder + its projection head
+#   SNN_pretrained.pt      gene encoder
+#   Spatial_pretrained.pt  spatial GCN (in_dim == --proj_dim)
 #
 # Example:
 '''
@@ -9,15 +24,16 @@ CUDA_VISIBLE_DEVICES=0 \
 --csv /data/project/banana9903_xenium/contrast_test/expression/human_reactive_follicular_patches_256/spot_patch_map_256.csv \
 --enc_name uni_v1 \
 --proj_dim 256 \
---epochs 50 --batch_size 256 \
---save_dir /data/project/banana9903_xenium/ckpts_human_reactive_follicular_xattn_10tokens \
+--epochs 100 --batch_size 256 \
+--save_dir /data/project/banana9903_xenium/ckpts_human_reactive_follicular_pretrain \
 --device cuda:0 \
---img_tokens 10 \
---gene_tokens 10 \
---coord_tokens 10 \
---graph_type delaunay
+--spot_hidden_dim 256 \
+--graph_type delaunay --k 12
 
+# Token counts (--img_tokens / --gene_tokens / --spot_tokens) belong to the
+# finetuning fusion, not here; passing them prints a warning and does nothing.
 '''
+import contextlib
 import os
 import sys
 import time
@@ -28,7 +44,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.optim import Adam
+from torch.optim import AdamW
 from tqdm import tqdm
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -40,21 +56,23 @@ if PROJECT_ROOT not in sys.path:
 sys.modules.pop("code", None)
 
 from code.models.Foundations import inf_encoder_factory
-from code.models.GCN_update import SpatialGCN
+from code.models.GCN_update import SpatialGCN, precompute_gcn_norm
 from code.models.graph_construction import build_knn_graph
 from code.models.gene_encoder import GeneEncoder
 from code.utils.lora_utils import attach_lora_to_foundation
-from code.utils.attention import CrossAttentionBlock
+from code.models.spot_features import build_histology_node_features, freeze_and_lock_eval
 from code.utils.contrastive import ImageFoundationAdapter, build_spatial_graph
 from code.utils.dataset_utils import (
+    SpotImageGeneDataset,
     load_h5ad_with_preproc,
     load_patch_mapping_csv_xenium,
     make_img_gene_dataloader,
+    make_img_only_dataloader,
     align_map_ids_to_obs,
     reorder_and_prune_by_obs,
     extract_coords_np_in_order,
 )
-from torch_geometric.utils import subgraph
+from torch_geometric.utils import k_hop_subgraph, subgraph
 
 
 # ----------------------------
@@ -99,94 +117,70 @@ def pick_amp_dtype(amp_dtype: str) -> torch.dtype:
 # ----------------------------
 # Model blocks
 # ----------------------------
-class XAttnContrastiveModel(nn.Module):
+class MultiBranchContrastiveModel(nn.Module):
+    """
+    Multi-branch contrastive pretraining, manuscript Eqs. (4)-(6).
+
+    The image embedding is the anchor and is aligned against the gene embedding
+    and the spatial(GCN) embedding by two InfoNCE branches computed on the
+    ENCODER OUTPUTS:
+
+        L_img-gene    = InfoNCE(z_i, z_g)                              (4)
+        L_img-spatial = InfoNCE(z_i, z_s)                              (5)
+        L             = lam_ig * L_img-gene + lam_is * L_img-spatial   (6)
+
+    Cross-attention belongs to the finetuning fusion (Eq. 8), not here. The
+    earlier XAttnContrastiveModel put the cross-attention *before* the loss,
+    which made the objective degenerate: CrossAttention adds a residual from its
+    query (attention.py: `norm(x + q)`), so both sides of the InfoNCE carried the
+    same sample's image AND gene. On synthetic data with zero mutual information
+    between the two modalities and fresh batches every step — where nothing is
+    learnable or memorizable — that loss still trained from log(64)=4.16 down to
+    0.13, i.e. it was solvable by a shortcut and measured no alignment at all.
+    """
+
     def __init__(
         self,
         img_encoder: nn.Module,
         gene_encoder: nn.Module,
         proj_dim: int,
-        num_heads: int = 8,
-        dropout: float = 0.1,
         temperature: float = 0.15,
         lam_dir: float = 0.5,
-        img_tokens: int = 1,
-        gene_tokens: int = 1,
-        coord_tokens: int = 1,
     ):
         super().__init__()
-        if img_tokens < 1 or gene_tokens < 1 or coord_tokens < 1:
-            raise ValueError("img_tokens/gene_tokens/coord_tokens must be >= 1")
         self.img_encoder = img_encoder
         self.gene_encoder = gene_encoder
         self.temperature = float(temperature)
         self.lam_dir = float(lam_dir)
         self.proj_dim = int(proj_dim)
-        self.img_tokens = int(img_tokens)
-        self.gene_tokens = int(gene_tokens)
-        self.coord_tokens = int(coord_tokens)
-
-        self.i2g = CrossAttentionBlock(proj_dim, proj_dim, proj_dim, num_heads, dropout)
-        self.g2i = CrossAttentionBlock(proj_dim, proj_dim, proj_dim, num_heads, dropout)
-        self.i2c = CrossAttentionBlock(proj_dim, proj_dim, proj_dim, num_heads, dropout)
-        self.c2i = CrossAttentionBlock(proj_dim, proj_dim, proj_dim, num_heads, dropout)
-
-        self.img_tokenizer = None if self.img_tokens == 1 else nn.Linear(proj_dim, proj_dim * self.img_tokens)
-        self.gene_tokenizer = None if self.gene_tokens == 1 else nn.Linear(proj_dim, proj_dim * self.gene_tokens)
-        self.coord_tokenizer = None if self.coord_tokens == 1 else nn.Linear(proj_dim, proj_dim * self.coord_tokens)
-
-    def _to_tokens(self, x: torch.Tensor, tokenizer: Optional[nn.Module], n_tokens: int) -> torch.Tensor:
-        if n_tokens == 1:
-            return x.unsqueeze(1)
-        t = tokenizer(x)
-        return t.view(x.size(0), n_tokens, self.proj_dim)
 
     @staticmethod
-    def _pool_tokens(x: torch.Tensor) -> torch.Tensor:
-        if x.size(1) == 1:
-            return x.squeeze(1)
-        return x.mean(dim=1)
-
-    def cross_attend(self, zi: torch.Tensor, zg: torch.Tensor, zc: torch.Tensor, return_attn: bool = False):
-        qi = self._to_tokens(zi, self.img_tokenizer, self.img_tokens)
-        kg = self._to_tokens(zg, self.gene_tokenizer, self.gene_tokens)
-        kc = self._to_tokens(zc, self.coord_tokenizer, self.coord_tokens)
-
-        if return_attn:
-            zi2g_t, attn_i2g = self.i2g(qi, kg, kg, return_attn=True)
-            zg2i_t, attn_g2i = self.g2i(kg, qi, qi, return_attn=True)
-            zi2c_t, attn_i2c = self.i2c(qi, kc, kc, return_attn=True)
-            zc2i_t, attn_c2i = self.c2i(kc, qi, qi, return_attn=True)
-        else:
-            zi2g_t = self.i2g(qi, kg, kg)
-            zg2i_t = self.g2i(kg, qi, qi)
-            zi2c_t = self.i2c(qi, kc, kc)
-            zc2i_t = self.c2i(kc, qi, qi)
-            attn_i2g = attn_g2i = attn_i2c = attn_c2i = None
-
-        zi2g = self._pool_tokens(zi2g_t)
-        zg2i = self._pool_tokens(zg2i_t)
-        zi2c = self._pool_tokens(zi2c_t)
-        zc2i = self._pool_tokens(zc2i_t)
-
-        zi2g = F.normalize(zi2g, dim=1)
-        zg2i = F.normalize(zg2i, dim=1)
-        zi2c = F.normalize(zi2c, dim=1)
-        zc2i = F.normalize(zc2i, dim=1)
-        if return_attn:
-            return zi2g, zg2i, zi2c, zc2i, {
-                "attn_i2g": attn_i2g,
-                "attn_g2i": attn_g2i,
-                "attn_i2c": attn_i2c,
-                "attn_c2i": attn_c2i,
-            }
-        return zi2g, zg2i, zi2c, zc2i
+    def normalize(*zs: torch.Tensor):
+        """Cosine-similarity space: sim(.,.) in Eqs. (4)-(5)."""
+        out = tuple(F.normalize(z, dim=1) for z in zs)
+        return out[0] if len(out) == 1 else out
 
     def contrastive_loss(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        logits = (a @ b.t()) / self.temperature
-        targets = torch.arange(logits.size(0), device=logits.device)
-        loss_ab = F.cross_entropy(logits, targets)
-        loss_ba = F.cross_entropy(logits.t(), targets)
-        return self.lam_dir * loss_ab + (1.0 - self.lam_dir) * loss_ba
+        """
+        InfoNCE over in-batch negatives. lam_dir=1.0 is the image-anchored form
+        printed as Eqs. (4)-(5); 0.5 is the symmetric CLIP form.
+
+        The similarity matrix and its softmax are computed in FP32. It is only
+        (B, B), so the cost is nil, and dividing cosine similarities by
+        tau=0.15 before a softmax is exactly where half precision loses
+        resolution. It also sidesteps an fp16 cublasGemmEx failure seen on
+        Blackwell for this matmul (attention.py carries the same workaround).
+        """
+        with torch.amp.autocast("cuda", enabled=False):
+            a = a.float()
+            b = b.float()
+            logits = (a @ b.t()) / self.temperature
+            targets = torch.arange(logits.size(0), device=logits.device)
+            loss_ab = F.cross_entropy(logits, targets)
+            if self.lam_dir >= 1.0:
+                return loss_ab
+            loss_ba = F.cross_entropy(logits.t(), targets)
+            return self.lam_dir * loss_ab + (1.0 - self.lam_dir) * loss_ba
 
 
 def _unique_trainable_params(*modules: Iterable[nn.Module]):
@@ -203,14 +197,55 @@ def _save_all(
     save_dir: str,
     img_encoder: nn.Module,
     gene_encoder: nn.Module,
-    coord_gcn: nn.Module,
-    xattn_model: nn.Module,
+    spot_gcn: nn.Module,
 ):
     os.makedirs(save_dir, exist_ok=True)
     torch.save(img_encoder.state_dict(), os.path.join(save_dir, "Image_pretrained.pt"))
     torch.save(gene_encoder.state_dict(), os.path.join(save_dir, "SNN_pretrained.pt"))
-    torch.save(coord_gcn.state_dict(), os.path.join(save_dir, "Coord_pretrained.pt"))
-    torch.save(xattn_model.state_dict(), os.path.join(save_dir, "XATTN_pretrained.pt"))
+    # Renamed from Coord_pretrained.pt: the GCN now consumes histology features,
+    # not coordinates, so the old file is not loadable into the new architecture.
+    torch.save(spot_gcn.state_dict(), os.path.join(save_dir, "Spatial_pretrained.pt"))
+    # No XATTN_pretrained.pt: pretraining has no cross-attention (Eqs. 4-6).
+    # The finetuning fusion (Eq. 8) is trained from scratch in stage 2.
+
+
+def gcn_receptive_field(batch_ids: torch.Tensor,
+                        edge_index: torch.Tensor,
+                        edge_weight: Optional[torch.Tensor],
+                        n_nodes: int,
+                        num_hops: int):
+    """
+    Exact receptive field of `batch_ids` under a `num_hops`-layer GCN.
+
+    A random mini-batch of a few hundred nodes drawn from a slide-scale graph has
+    an almost empty induced subgraph (expected intra-batch edges ~ E*(B/N)^2), so
+    running the GCN on `subgraph(batch_ids, ...)` degenerates to the self-loops
+    and the spatial branch learns nothing spatial. Instead we take every node
+    within `num_hops` of the batch and run the GCN on the induced subgraph of
+    that set — the outputs at the batch rows are then bit-identical to a
+    full-graph forward pass.
+
+    Returns:
+        subset:  (S,) node ids in the receptive field
+        sub_ei:  (2, E') edge index relabelled to [0, S)
+        sub_ew:  (E',) edge weights or None
+        mapping: (B,) row of each batch node inside `subset`
+    """
+    subset, _, _, _ = k_hop_subgraph(
+        batch_ids, num_hops, edge_index, relabel_nodes=False, num_nodes=n_nodes
+    )
+    sub_ei, sub_ew = subgraph(
+        subset, edge_index, edge_attr=edge_weight,
+        relabel_nodes=True, num_nodes=n_nodes,
+    )
+    pos = torch.full((n_nodes,), -1, dtype=torch.long, device=subset.device)
+    pos[subset] = torch.arange(subset.numel(), device=subset.device)
+    mapping = pos[batch_ids]
+    if int((mapping < 0).sum()) > 0:
+        raise RuntimeError("batch node missing from its own receptive field")
+    sub_ei = sub_ei.long().contiguous()
+    sub_ew = sub_ew.to(torch.float32).contiguous() if sub_ew is not None else None
+    return subset, sub_ei, sub_ew, mapping
 
 def _is_finite(*tensors: torch.Tensor) -> bool:
     for t in tensors:
@@ -219,22 +254,6 @@ def _is_finite(*tensors: torch.Tensor) -> bool:
         if not torch.isfinite(t).all().item():
             return False
     return True
-
-
-def _save_attn_npz(path: str, attn_map: Dict[str, torch.Tensor], reduce_heads: bool, meta: Dict[str, np.ndarray] | None = None):
-    payload: Dict[str, np.ndarray] = {}
-    for k, v in attn_map.items():
-        if v is None:
-            continue
-        x = v.detach().float().cpu()
-        if reduce_heads and x.ndim == 4:
-            x = x.mean(dim=1)
-        payload[k] = x.numpy()
-    if meta is not None:
-        payload.update(meta)
-    if not payload:
-        return
-    np.savez_compressed(path, **payload)
 
 
 def main():
@@ -252,58 +271,78 @@ def main():
                    help="CSV 좌표 컬럼을 사용 (x_he_px, y_he_px 등)")
     p.add_argument("--csv_coord_cols", default="x_he_px,y_he_px")
     p.add_argument("--csv_to_unit", type=float, default=None)
-    p.add_argument("--coord_norm", default="standardize", choices=["standardize", "none"])
+    p.add_argument("--coord_norm", default="standardize", choices=["standardize", "none"],
+                   help="DEPRECATED / no effect. Coordinates are only used to build "
+                        "the graph edges; GCN node features are histology embeddings.")
 
     # model / foundation
     p.add_argument("--enc_name", default="uni_v1",
                    choices=["uni_v1","virchow","virchow2","gigapath","hoptimus0","plip","phikon","conch_v1"])
+    p.add_argument("--enc_weights_path", default=None,
+                   help="Local foundation weights dir (containing pytorch_model.bin). "
+                        "Unset falls back to $SPAM_UNI_WEIGHTS, then to a HF-hub "
+                        "download. Nothing here silently random-inits: a failure "
+                        "to obtain the pretrained weights raises.")
     p.add_argument("--proj_dim", type=int, default=256)
+    _bb = p.add_mutually_exclusive_group()
+    _bb.add_argument("--freeze_backbone", dest="freeze_backbone", action="store_true",
+                     default=True,
+                     help="Freeze the foundation backbone; train only the projection "
+                          "head (default, matches Fig. 1).")
+    _bb.add_argument("--train_backbone", dest="freeze_backbone", action="store_false",
+                     help="Optimize the whole backbone as well (previous behaviour).")
     p.add_argument("--with_lora", action="store_true",
                    help="HF 기반 백본(plip/phikon)에서만 활성화. timm 백본은 자동으로 스킵됨.")
     p.add_argument("--lora_r", type=int, default=16)
     p.add_argument("--lora_alpha", type=int, default=32)
     p.add_argument("--lora_dropout", type=float, default=0.05)
 
-    # graph / coord-gcn
-    p.add_argument("--k", type=int, default=12, help="KNN k for spatial graph")
-    p.add_argument("--graph_type", default="knn", choices=["knn", "delaunay"],
-                   help="Spatial graph type for coordinate-based GCN.")
+    # graph / spatial gcn
+    p.add_argument("--k", type=int, default=12,
+                   help="k for the KNN graph (also the Delaunay fallback)")
+    p.add_argument("--graph_type", default="delaunay", choices=["knn", "delaunay"],
+                   help="Spatial graph over the spot centroids. The manuscript uses "
+                        "Delaunay triangulation; 'knn' is kept for ablation.")
+    p.add_argument("--gcn_hops", type=int, default=2,
+                   help="Receptive field per mini-batch. Must equal the GCN depth "
+                        "(SpatialGCN has 2 layers) for exact full-graph outputs.")
     p.add_argument("--gcn_device", default=None,
                    help='GCN device override: "cpu", "cuda", "cuda:0" ... (default: use --device)')
 
-    # xattn
-    p.add_argument("--xattn_heads", type=int, default=8)
-    p.add_argument("--xattn_dropout", type=float, default=0.1)
-    p.add_argument("--img_tokens", type=int, default=1,
-                   help="number of image query tokens for cross-attention")
-    p.add_argument("--gene_tokens", type=int, default=1,
-                   help="number of gene tokens for cross-attention")
-    p.add_argument("--coord_tokens", type=int, default=1,
-                   help="number of coordinate tokens for cross-attention")
-    p.add_argument("--coord_hidden_dim", type=int, default=128)
-    p.add_argument("--coord_dropout", type=float, default=0.1)
-    p.add_argument("--save_attn", action="store_true",
-                   help="save attention weights for sampled training batches")
-    p.add_argument("--attn_out_dir", default=None,
-                   help="directory to save attention npz files (default: <save_dir>/attn)")
-    p.add_argument("--attn_max_batches", type=int, default=10,
-                   help="max number of batches to dump per epoch when --save_attn")
-    p.add_argument("--attn_every", type=int, default=1,
-                   help="save attention every N epochs when --save_attn")
-    p.add_argument("--attn_reduce_heads", action="store_true",
-                   help="store mean over heads instead of per-head attention")
+    # spatial GCN
+    p.add_argument("--spot_hidden_dim", "--coord_hidden_dim", dest="spot_hidden_dim",
+                   type=int, default=256,
+                   help="hidden width of the spatial GCN. Must match the finetuning "
+                        "script's --spot_hidden_dim or the checkpoint will not load.")
+    p.add_argument("--spot_dropout", "--coord_dropout", dest="spot_dropout",
+                   type=float, default=0.1)
+
+    # Deprecated: pretraining has no cross-attention (Eqs. 4-6). Accepted so
+    # existing command lines keep running; ignored with a warning. Token counts
+    # and attention dumps belong to the finetuning fusion (Eq. 8).
+    for _dead in ["--xattn_heads", "--xattn_dropout", "--img_tokens",
+                  "--gene_tokens", "--spot_tokens", "--coord_tokens",
+                  "--attn_out_dir", "--attn_max_batches", "--attn_every"]:
+        p.add_argument(_dead, dest=_dead.lstrip("-").replace("-", "_"),
+                       default=None, help=argparse.SUPPRESS)
+    for _dead in ["--save_attn", "--attn_reduce_heads"]:
+        p.add_argument(_dead, dest=_dead.lstrip("-").replace("-", "_"),
+                       action="store_true", help=argparse.SUPPRESS)
 
     # training
-    p.add_argument("--epochs", type=int, default=50)
-    p.add_argument("--batch_size", type=int, default=64)
+    p.add_argument("--epochs", type=int, default=100)      # Supp.: 100 for pretraining
+    p.add_argument("--batch_size", type=int, default=128)  # Supp.: 128
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--temperature", type=float, default=0.15)
     p.add_argument("--lam_dir", type=float, default=0.5,
-                   help="방향성 가중치 (A→B vs B→A). 0.5=대칭")
-    p.add_argument("--lam_ig", type=float, default=1.0, help="image↔gene loss weight")
-    p.add_argument("--lam_ic", type=float, default=1.0, help="image↔coord loss weight")
+                   help="InfoNCE 방향성. 1.0 = 논문 Eq.(4)-(5) 그대로 image-anchored, "
+                        "0.5 = 대칭 CLIP 형태(기본).")
+    p.add_argument("--lam_ig", type=float, default=1.0,
+                   help="lambda_g in Eq. (6): image<->gene branch weight")
+    p.add_argument("--lam_is", "--lam_ic", dest="lam_is", type=float, default=1.0,
+                   help="image↔spatial(GCN) loss weight")
     p.add_argument("--lr", type=float, default=1e-5)
-    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--weight_decay", type=float, default=0.05)  # Supp.: 0.05
     p.add_argument("--max_norm", type=float, default=0.0)
     p.add_argument("--save_dir", default="./ckpts")
 
@@ -323,12 +362,20 @@ def main():
         args.amp = False
     use_amp = bool(args.amp and device.type == "cuda")
     print(f"[Device] {device}, AMP={args.amp}, dtype={amp_dtype}")
-    print(f"[XAttnTokens] img={args.img_tokens}, gene={args.gene_tokens}, coord={args.coord_tokens}")
-    attn_out_dir = None
-    if args.save_attn:
-        attn_out_dir = args.attn_out_dir or os.path.join(args.save_dir, "attn")
-        os.makedirs(attn_out_dir, exist_ok=True)
-        print(f"[AttnSave] dir={attn_out_dir} max_batches={args.attn_max_batches} every={args.attn_every}")
+
+    _ignored = [f for f in ["xattn_heads", "xattn_dropout", "img_tokens", "gene_tokens",
+                            "spot_tokens", "coord_tokens", "save_attn", "attn_out_dir",
+                            "attn_max_batches", "attn_every", "attn_reduce_heads"]
+                if getattr(args, f, None)]
+    if _ignored:
+        print(f"[WARN] ignoring cross-attention flags {_ignored}: pretraining is "
+              "plain InfoNCE on the encoder outputs (Eqs. 4-6). Token counts and "
+              "attention dumps only apply to the finetuning fusion (Eq. 8).")
+
+    _dir = "image-anchored (Eq. 4-5)" if args.lam_dir >= 1.0 else "symmetric CLIP"
+    print(f"[Loss] L = {args.lam_ig}*InfoNCE(z_img, z_gene) + "
+          f"{args.lam_is}*InfoNCE(z_img, z_spatial), tau={args.temperature}, {_dir}")
+
     if args.temperature <= 0:
         raise ValueError(f"--temperature must be > 0, got {args.temperature}")
 
@@ -384,27 +431,19 @@ def main():
             csv_to_unit=args.csv_to_unit,
         )
 
-    if args.coord_norm == "standardize":
-        mean = coords_np.mean(axis=0, keepdims=True)
-        std = coords_np.std(axis=0, keepdims=True)
-        std[std == 0] = 1.0
-    else:
-        mean = np.zeros((1, coords_np.shape[1]), dtype=np.float32)
-        std = np.ones((1, coords_np.shape[1]), dtype=np.float32)
-
-    coords_feat = ((coords_np - mean) / std).astype(np.float32)
-    if not np.isfinite(coords_feat).all():
-        raise RuntimeError("coords_feat contains NaN/Inf. Check coord normalization or input coords.")
-    coords_feat_t = torch.from_numpy(coords_feat)
+    if not np.isfinite(coords_np).all():
+        raise RuntimeError("coords contain NaN/Inf. Check adata.obsm[coord_key].")
+    n_nodes = int(coords_np.shape[0])
     id_to_idx: Dict[str, int] = {
         str(sid): i for i, sid in enumerate(map_df_aligned["spot_id"].tolist())
     }
 
-    # 1b) Build spatial graph for GCN (use raw coords for neighbor search)
+    # 1b) Spatial graph. Coordinates define the EDGES only — the GCN node
+    #     features H(0) are the histology embeddings built further below.
     edge_index, edge_weight = build_spatial_graph(
         coords_np, k=args.k, use_weight=True, graph_type=args.graph_type
     )
-    print(f"[Graph] type={args.graph_type}, k={args.k}, E={edge_index.size(1)}")
+    print(f"[Graph] type={args.graph_type}, k={args.k}, N={n_nodes}, E={edge_index.size(1)}")
     edge_index = edge_index.to(gcn_device, non_blocking=True).long().contiguous()
     edge_weight = (
         edge_weight.to(gcn_device, non_blocking=True).to(torch.float32).contiguous()
@@ -412,16 +451,25 @@ def main():
         else None
     )
     if edge_weight is not None and not torch.isfinite(edge_weight).all().item():
-        raise RuntimeError("edge_weight contains NaN/Inf. Check coords and KNN graph construction.")
-    coords_feat_t = coords_feat_t.to(gcn_device, non_blocking=True)
+        raise RuntimeError("edge_weight contains NaN/Inf. Check coords and graph construction.")
+
+    # Normalize once on the full graph so that mini-batch subgraphs reproduce the
+    # full-graph forward pass exactly (see precompute_gcn_norm).
+    edge_index, edge_weight = precompute_gcn_norm(edge_index, edge_weight, n_nodes)
+    edge_index = edge_index.long().contiguous()
+    edge_weight = edge_weight.to(torch.float32).contiguous()
 
     # 2) Foundation + transforms
     FoundationCls = inf_encoder_factory(args.enc_name)
-    foundation = FoundationCls(weights_path=None)
+    foundation = FoundationCls(weights_path=args.enc_weights_path)
+    print(f"[Backbone] {args.enc_name}, weights="
+          f"{args.enc_weights_path or os.environ.get('SPAM_UNI_WEIGHTS') or 'hf-hub (download)'}")
 
     # --- LoRA: HF기반 백본만 허용 (timm 백본은 스킵) ---
     lora_allowed = args.enc_name in {"plip", "phikon"}
     if args.with_lora:
+        if args.freeze_backbone:
+            raise ValueError("--with_lora and --freeze_backbone are mutually exclusive")
         if lora_allowed:
             foundation = attach_lora_to_foundation(
                 foundation,
@@ -432,7 +480,22 @@ def main():
         else:
             print(f"[LoRA] skipped for backbone='{args.enc_name}' (timm/open-clip backbone not supported).")
 
+    # Fig. 1 marks the pretraining Image Encoder frozen (❄️) with only the
+    # Projection head trainable (🔥). Left unfrozen, the full ~303M ViT-L is
+    # optimized by the contrastive objective on a single slide's cells, which
+    # both drifts the foundation representation off-distribution and is what the
+    # figure does not depict.
+    if args.freeze_backbone:
+        n_frozen = freeze_and_lock_eval(foundation.encoder)
+        print(f"[Freeze] image backbone frozen: {n_frozen/1e6:.1f}M params "
+              "(only the projection head trains, per Fig. 1)")
+    else:
+        n_bb = sum(p_bb.numel() for p_bb in foundation.encoder.parameters())
+        print(f"[Freeze][warn] --train_backbone: optimizing {n_bb/1e6:.1f}M backbone "
+              f"params at lr={args.lr}. Fig. 1 shows this encoder frozen.")
+
     foundation.precision = amp_dtype
+    img_dim = foundation.get_output_dim()
     image_tf = getattr(foundation, "eval_transforms", None)
 
     # 3) DataLoader (img, gene, sid)
@@ -442,6 +505,17 @@ def main():
         image_transform=image_tf
     )
 
+    # Dense gene matrix in node order, so the frozen-backbone path can drop the
+    # image pipeline entirely and still serve the gene branch.
+    gene_ds = SpotImageGeneDataset(
+        adata=adata, map_df=map_df_aligned, gene_names=None, image_transform=image_tf,
+    )
+    _gx = adata[map_df_aligned["spot_id"].astype(str).tolist()].X[:, gene_ds._gene_index]
+    if hasattr(_gx, "toarray"):
+        _gx = _gx.toarray()
+    gene_matrix = torch.from_numpy(np.asarray(_gx, dtype=np.float32))
+    assert gene_matrix.shape == (n_nodes, gene_dim), (gene_matrix.shape, n_nodes, gene_dim)
+
     # 4) Models
     img_encoder = ImageFoundationAdapter(foundation, proj_dim=args.proj_dim, normalize=False)
     gene_encoder = GeneEncoder(
@@ -450,31 +524,80 @@ def main():
         proj_dim=args.proj_dim,
         normalize=False,
     )
-    coord_gcn = SpatialGCN(
-        in_dim=coords_np.shape[1],
-        hidden_dim=args.coord_hidden_dim,
+    # H(0) = histology embedding (post-projection), so in_dim == proj_dim.
+    spot_gcn = SpatialGCN(
+        in_dim=args.proj_dim,
+        hidden_dim=args.spot_hidden_dim,
         out_dim=args.proj_dim,
-        dropout=args.coord_dropout,
+        dropout=args.spot_dropout,
+        normalize=False,   # edge weights were pre-normalized on the full graph
     )
-    coord_gcn.to(gcn_device).float()
-    model = XAttnContrastiveModel(
+    spot_gcn.to(gcn_device).float()
+    model = MultiBranchContrastiveModel(
         img_encoder=img_encoder,
         gene_encoder=gene_encoder,
         proj_dim=args.proj_dim,
-        num_heads=args.xattn_heads,
-        dropout=args.xattn_dropout,
         temperature=args.temperature,
         lam_dir=args.lam_dir,
-        img_tokens=args.img_tokens,
-        gene_tokens=args.gene_tokens,
-        coord_tokens=args.coord_tokens,
     )
 
     # 5) Train
     model.to(device).train()
-    optimizer = Adam(_unique_trainable_params(model, coord_gcn), lr=args.lr, weight_decay=args.weight_decay)
+    # Manuscript (Supp.): AdamW, lr 1e-5, weight decay 0.05.
+    optimizer = AdamW(_unique_trainable_params(model, spot_gcn),
+                      lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
     amp_dtype_found = getattr(model.img_encoder.foundation, "precision", None)
+
+    # 5b) H(0) source for the spatial GCN.
+    #
+    # A mini-batch carries live embeddings only for its own nodes, but a 2-layer
+    # GCN over a batch node also needs its 2-hop neighbours' features.
+    ordered_img_loader = make_img_only_dataloader(
+        map_df=map_df_aligned,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        image_transform=image_tf,
+        shuffle=False,
+    )
+
+    if args.freeze_backbone:
+        # The backbone is constant, so its output can be cached once and the
+        # image pipeline dropped from the training loop entirely: H(0) for any
+        # node set is just proj(raw_feat[nodes]), computed live from the current
+        # (trainable) projection. Exact — no stale feature bank — and it removes
+        # both the ViT forward and the PNG decode from every step.
+        raw_feat = build_histology_node_features(
+            img_encoder=foundation,
+            loader=ordered_img_loader,
+            n_nodes=n_nodes,
+            out_dim=img_dim,
+            device=device,
+            amp_dtype=amp_dtype if use_amp else None,
+        ).to(gcn_device)
+        feat_bank = None
+        gene_matrix_g = gene_matrix.to(device)
+        train_loader = torch.utils.data.DataLoader(
+            torch.utils.data.TensorDataset(torch.arange(n_nodes, dtype=torch.long)),
+            batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=False,
+        )
+        print(f"[Cache] frozen backbone -> cached {tuple(raw_feat.shape)} raw features "
+              f"({raw_feat.numel()*4/1e9:.2f} GB); training loop no longer reads images")
+    else:
+        # Trainable backbone: neighbours come from a write-through bank seeded by
+        # one no-grad pass, with the batch rows substituted live so gradients
+        # still reach the image encoder.
+        raw_feat = None
+        gene_matrix_g = None
+        feat_bank = build_histology_node_features(
+            img_encoder=model.img_encoder,
+            loader=ordered_img_loader,
+            n_nodes=n_nodes,
+            out_dim=args.proj_dim,
+            device=device,
+            amp_dtype=amp_dtype if use_amp else None,
+        ).to(gcn_device)
+    model.train()
 
     t0 = time.time()
     for epoch in range(1, args.epochs + 1):
@@ -482,66 +605,71 @@ def main():
         bar = tqdm(enumerate(train_loader, 1), total=len(train_loader),
                    desc=f"[xattn] Epoch {epoch}/{args.epochs}", leave=False)
         for step, batch in bar:
-            if len(batch) == 3:
-                img, gene, sid = batch
+            if raw_feat is not None:
+                # Frozen-backbone path: batch is just node indices.
+                batch_ids = batch[0].to(gcn_device, non_blocking=True)
+                gene = gene_matrix_g[batch_ids.to(device)]
+                img = None
             else:
-                img, gene = batch
-                sid = None
-            img = img.to(device, non_blocking=True)
-            gene = gene.to(device, non_blocking=True)
-
-            if sid is None:
-                raise RuntimeError("sid not found in dataloader batch. Check dataset.")
-            batch_ids = torch.as_tensor(
-                [id_to_idx[str(s).strip().replace(".0", "")] for s in sid],
-                dtype=torch.long,
-                device=gcn_device,
+                if len(batch) == 3:
+                    img, gene, sid = batch
+                else:
+                    raise RuntimeError("sid not found in dataloader batch. Check dataset.")
+                img = img.to(device, non_blocking=True)
+                gene = gene.to(device, non_blocking=True)
+                batch_ids = torch.as_tensor(
+                    [id_to_idx[str(s).strip().replace(".0", "")] for s in sid],
+                    dtype=torch.long,
+                    device=gcn_device,
+                )
+            subset, sub_ei, sub_ew, mapping = gcn_receptive_field(
+                batch_ids, edge_index, edge_weight, n_nodes, args.gcn_hops
             )
-            sub_ei, sub_ew = subgraph(
-                subset=batch_ids, edge_index=edge_index, edge_attr=edge_weight, relabel_nodes=True
-            )
-            sub_ei = sub_ei.long().contiguous()
-            sub_ew = sub_ew.to(torch.float32).contiguous() if sub_ew is not None else None
-            coord_feat_batch = coords_feat_t[batch_ids]
-            dump_attn_this_batch = bool(
-                args.save_attn
-                and attn_out_dir is not None
-                and args.attn_max_batches > 0
-                and (epoch % max(args.attn_every, 1) == 0)
-                and (step <= args.attn_max_batches)
-            )
-
             optimizer.zero_grad(set_to_none=True)
             if use_amp:
                 if amp_dtype_found in (torch.bfloat16, torch.float16):
                     ctx = torch.amp.autocast("cuda", dtype=amp_dtype_found)
                 else:
                     ctx = torch.amp.autocast("cuda")
-                # GCN은 FP32로 강제
+            else:
+                ctx = contextlib.nullcontext()
+
+            # GCN은 FP32로 강제.
+            if raw_feat is not None:
+                # H(0) for the whole receptive field straight from the cache,
+                # through the live projection head. Exact, no staleness.
                 with torch.amp.autocast("cuda", enabled=False):
-                    zc = coord_gcn(coord_feat_batch.float(), sub_ei, sub_ew)
-                zc = zc.to(device, non_blocking=True)
+                    h0 = model.img_encoder.proj(raw_feat[subset].float())
+                    zs_sub = spot_gcn(h0, sub_ei, sub_ew)
+                zi = h0[mapping].to(device, non_blocking=True)
+                with ctx:
+                    zg = model.gene_encoder(gene)
+                zs = zs_sub[mapping].to(device, non_blocking=True).to(dtype=zi.dtype)
+            else:
                 with ctx:
                     zi = model.img_encoder(img)
                     zg = model.gene_encoder(gene)
-                    zc = zc.to(dtype=zi.dtype)
-                    if not _is_finite(zi, zg, zc):
-                        print("[WARN] NaN/Inf detected in embeddings (AMP). Skipping batch.")
-                        continue
-                    if dump_attn_this_batch:
-                        zi2g, zg2i, zi2c, zc2i, attn_map = model.cross_attend(zi, zg, zc, return_attn=True)
-                    else:
-                        zi2g, zg2i, zi2c, zc2i = model.cross_attend(zi, zg, zc, return_attn=False)
-                        attn_map = None
-                    if not _is_finite(zi2g, zg2i, zi2c, zc2i):
-                        print("[WARN] NaN/Inf detected after cross-attention (AMP). Skipping batch.")
-                        continue
-                    loss_ig = model.contrastive_loss(zi2g, zg2i)
-                    loss_ic = model.contrastive_loss(zi2c, zc2i)
-                    loss = args.lam_ig * loss_ig + args.lam_ic * loss_ic
-                    if not _is_finite(loss):
-                        print("[WARN] NaN/Inf loss detected (AMP). Skipping batch.")
-                        continue
+                # H(0): 이웃은 bank, 배치 노드는 live zi.
+                with torch.amp.autocast("cuda", enabled=False):
+                    h0 = feat_bank[subset].index_copy(0, mapping, zi.float().to(gcn_device))
+                    zs_sub = spot_gcn(h0, sub_ei, sub_ew)
+                zs = zs_sub[mapping].to(device, non_blocking=True).to(dtype=zi.dtype)
+
+            if not _is_finite(zi, zg, zs):
+                print("[WARN] NaN/Inf detected in embeddings. Skipping batch.")
+                continue
+
+            with ctx:
+                # Eqs. (4)-(6): InfoNCE directly on the encoder outputs.
+                zi_n, zg_n, zs_n = model.normalize(zi, zg, zs)
+                loss_ig = model.contrastive_loss(zi_n, zg_n)
+                loss_is = model.contrastive_loss(zi_n, zs_n)
+                loss = args.lam_ig * loss_ig + args.lam_is * loss_is
+            if not _is_finite(loss):
+                print("[WARN] NaN/Inf loss detected. Skipping batch.")
+                continue
+
+            if use_amp:
                 scaler.scale(loss).backward()
                 if args.max_norm > 0:
                     scaler.unscale_(optimizer)
@@ -549,50 +677,21 @@ def main():
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                zc = coord_gcn(coord_feat_batch.float(), sub_ei, sub_ew)
-                zc = zc.to(device, non_blocking=True)
-                zi = model.img_encoder(img)
-                zg = model.gene_encoder(gene)
-                if not _is_finite(zi, zg, zc):
-                    print("[WARN] NaN/Inf detected in embeddings. Skipping batch.")
-                    continue
-                if dump_attn_this_batch:
-                    zi2g, zg2i, zi2c, zc2i, attn_map = model.cross_attend(zi, zg, zc, return_attn=True)
-                else:
-                    zi2g, zg2i, zi2c, zc2i = model.cross_attend(zi, zg, zc, return_attn=False)
-                    attn_map = None
-                if not _is_finite(zi2g, zg2i, zi2c, zc2i):
-                    print("[WARN] NaN/Inf detected after cross-attention. Skipping batch.")
-                    continue
-                loss_ig = model.contrastive_loss(zi2g, zg2i)
-                loss_ic = model.contrastive_loss(zi2c, zc2i)
-                loss = args.lam_ig * loss_ig + args.lam_ic * loss_ic
-                if not _is_finite(loss):
-                    print("[WARN] NaN/Inf loss detected. Skipping batch.")
-                    continue
                 loss.backward()
                 if args.max_norm > 0:
                     nn.utils.clip_grad_norm_(model.parameters(), args.max_norm)
                 optimizer.step()
 
-            if dump_attn_this_batch and attn_map is not None:
-                out_npz = os.path.join(attn_out_dir, f"ep{epoch:03d}_step{step:04d}.npz")
-                _save_attn_npz(
-                    out_npz,
-                    attn_map,
-                    reduce_heads=args.attn_reduce_heads,
-                    meta={
-                        "node_idx": batch_ids.detach().cpu().numpy(),
-                        "spot_id": np.asarray([str(s) for s in sid]),
-                    },
-                )
+            if feat_bank is not None:
+                # Write-through: the bank must track the encoder as it drifts.
+                feat_bank[batch_ids] = zi.detach().float().to(gcn_device)
 
             running += loss.item()
             if step % 50 == 0:
                 bar.set_postfix(loss=f"{running/50:.4f}")
                 running = 0.0
 
-        _save_all(args.save_dir, img_encoder, gene_encoder, coord_gcn, model)
+        _save_all(args.save_dir, img_encoder, gene_encoder, spot_gcn)
 
     print(f"Training done. ({time.time()-t0:.1f}s)")
 

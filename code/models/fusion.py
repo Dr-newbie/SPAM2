@@ -63,32 +63,46 @@ class CrossModalFusion(nn.Module):
             return x.squeeze(1)
         return x.mean(dim=1)
 
-    def forward(self, z_img, z_spot, z_gene, return_attn: bool = False):
+    def forward(self, z_img, z_spot, z_gene, return_attn: bool = False,
+                use_spot: bool = True, use_gene: bool = True):
+        # Modality ablation (R2 experiment): use_spot / use_gene gate the two
+        # cross-attention branches. all=both, image+coords=spot only,
+        # image+gene=gene only, image only=neither (pooled image query).
         Qi = self._to_tokens(z_img, self.img_tokenizer, self.img_tokens, self.dim_img)
-        Ks = self._to_tokens(z_spot, self.spot_tokenizer, self.spot_tokens, self.dim_spot)
-        Kg = self._to_tokens(z_gene, self.gene_tokenizer, self.gene_tokens, self.dim_gene)
-
-        # img<-spot / img<-gene
-        if return_attn:
-            his, attn_is = self.xa_is(Qi, Ks, Ks, return_attn=True)
-            hig, attn_ig = self.xa_ig(Qi, Kg, Kg, return_attn=True)
-        else:
-            his = self.xa_is(Qi, Ks, Ks)  # (B,T,Dout)
-            hig = self.xa_ig(Qi, Kg, Kg)  # (B,T,Dout)
-            attn_is, attn_ig = None, None
+        attn_is, attn_ig = None, None
+        his = hig = None
+        if use_spot:
+            Ks = self._to_tokens(z_spot, self.spot_tokenizer, self.spot_tokens, self.dim_spot)
+            if return_attn:
+                his, attn_is = self.xa_is(Qi, Ks, Ks, return_attn=True)
+            else:
+                his = self.xa_is(Qi, Ks, Ks)  # (B,T,Dout)
+        if use_gene:
+            Kg = self._to_tokens(z_gene, self.gene_tokenizer, self.gene_tokens, self.dim_gene)
+            if return_attn:
+                hig, attn_ig = self.xa_ig(Qi, Kg, Kg, return_attn=True)
+            else:
+                hig = self.xa_ig(Qi, Kg, Kg)  # (B,T,Dout)
 
         # merge
-        if self.merge == "gated-sum":
-            cat = torch.cat([his, hig], dim=-1)     # (B,1,2D)
-            gate = self.gate(cat)                   # (B,1,D)
-            z = gate * his + (1.0 - gate) * hig     # (B,1,D)
+        if use_spot and use_gene:
+            if self.merge == "gated-sum":
+                cat = torch.cat([his, hig], dim=-1)     # (B,T,2D)
+                gate = self.gate(cat)                   # (B,T,D)
+                z = gate * his + (1.0 - gate) * hig     # (B,T,D)
+            else:
+                z = torch.cat([his, hig], dim=-1)       # (B,T,2D)
+                z = self.proj(z)                        # (B,T,D)
+        elif use_spot:
+            z = his                                     # image + coords
+        elif use_gene:
+            z = hig                                     # image + gene
         else:
-            z = torch.cat([his, hig], dim=-1)       # (B,1,2D)
-            z = self.proj(z)                        # (B,1,D)
+            z = Qi                                      # image only (dim_img == dim_out)
 
         z_pooled = self._pool_tokens(z)
-        his_pooled = self._pool_tokens(his)
-        hig_pooled = self._pool_tokens(hig)
+        his_pooled = self._pool_tokens(his) if his is not None else z_pooled
+        hig_pooled = self._pool_tokens(hig) if hig is not None else z_pooled
         if return_attn:
             return z_pooled, his_pooled, hig_pooled, {"attn_is": attn_is, "attn_ig": attn_ig}
         return z_pooled, his_pooled, hig_pooled

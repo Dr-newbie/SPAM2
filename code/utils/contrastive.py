@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os
+import sys
 import time
 from typing import Optional, Iterable, Tuple
 
@@ -18,6 +19,7 @@ from code.models.graph_construction import build_knn_graph
 from code.models.graph_construction_delaunay import build_delaunay_graph
 from code.models.GCN_update import SpatialGCN
 from code.utils.lora_utils import attach_lora_to_foundation
+from code.utils.wandb_utils import wandb_log, wandb_summary
 
 # PyG: 서브그래프 유틸 (미니배치용)
 from torch_geometric.utils import subgraph
@@ -90,28 +92,11 @@ class img2gene_ContrastiveModel(nn.Module):
         return self.encode(img, gene)
 
     def contrastive_loss(self, img_z, gene_z):
-        try:
-            logits = (img_z @ gene_z.t()) / self.temperature
-            targets = torch.arange(logits.size(0), device=logits.device)
-            loss_i2g = F.cross_entropy(logits, targets)
-            loss_g2i = F.cross_entropy(logits.t(), targets)
-            return self.lam * loss_i2g + (1.0 - self.lam) * loss_g2i
-        except RuntimeError as e:
-            if "CUBLAS_STATUS_INVALID_VALUE" not in str(e):
-                raise
-            if img_z.device.type == "cuda":
-                if not hasattr(self, "_warned_cpu_fallback"):
-                    print("[WARN] img↔gene matmul failed on CUDA; falling back to CPU for logits/loss.")
-                    self._warned_cpu_fallback = True
-                img_cpu = img_z.float().cpu()
-                gene_cpu = gene_z.float().cpu()
-                logits = (img_cpu @ gene_cpu.t()) / self.temperature
-                targets = torch.arange(logits.size(0), device=logits.device)
-                loss_i2g = F.cross_entropy(logits, targets)
-                loss_g2i = F.cross_entropy(logits.t(), targets)
-                loss = self.lam * loss_i2g + (1.0 - self.lam) * loss_g2i
-                return loss.to(img_z.device)
-            raise
+        logits = (img_z @ gene_z.t()) / self.temperature
+        targets = torch.arange(logits.size(0), device=logits.device)
+        loss_i2g = F.cross_entropy(logits, targets)
+        loss_g2i = F.cross_entropy(logits.t(), targets)
+        return self.lam * loss_i2g + (1.0 - self.lam) * loss_g2i
 
 
 # ----------------------------
@@ -647,7 +632,16 @@ def train_joint_img_gene_spatial(
     device: Optional[str] = None,
     log_every: int = 50,
     save_dir: Optional[str] = None,
+    early_stopping: bool = False,
+    patience: int = 5,
+    min_delta: float = 0.0,
+    save_best: bool = True,
 ):
+    """
+    early_stopping / save_best 는 **train loss** 기준으로 동작한다.
+    이 파이프라인에는 held-out validation split이 없어서 감시할 val 지표가 없다.
+    train loss 기준 early stopping은 발산/정체는 잡아주지만 과적합은 잡지 못한다.
+    """
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     gcn_device = torch.device(gcn_device) if gcn_device is not None else device
     if gcn_device.type == "cpu" and use_amp:
@@ -679,11 +673,28 @@ def train_joint_img_gene_spatial(
     t0 = time.time()
     base = 0
     N = int(edge_index.max().item())+1
-    for epoch in range(1, epochs + 1):
+    global_step = 0
+    best_epoch_loss = float("inf")
+    best_epoch = -1
+    epochs_no_improve = 0
+    stopped_early = False
+
+    # nohup/파일 리다이렉트에서는 tqdm이 \r 로 로그를 도배하므로 갱신 주기를 늘린다.
+    _is_tty = sys.stderr.isatty()
+    _tqdm_kw = dict(mininterval=0.1 if _is_tty else 30.0,
+                    dynamic_ncols=True, file=sys.stderr)
+
+    epoch_bar = tqdm(range(1, epochs + 1), desc="[JOINT] epochs",
+                     unit="ep", leave=True, **_tqdm_kw)
+    for epoch in epoch_bar:
         running = 0.0
+        running_n = 0
         base = 0
+        epoch_sum, epoch_n = 0.0, 0
+        epoch_seen = 0
+        epoch_t0 = time.time()
         bar = tqdm(enumerate(img_loader, 0), total=len(img_loader),
-                   desc=f"[JOINT] Epoch {epoch}/{epochs}", leave=False)
+                   desc=f"[JOINT] Epoch {epoch}/{epochs}", leave=False, **_tqdm_kw)
         for step, img_batch in bar:
             imgs_b, node_ids = _split_batch_for_spatial(img_batch)
             B = imgs_b.size(0)
@@ -774,13 +785,92 @@ def train_joint_img_gene_spatial(
                     nn.utils.clip_grad_norm_(params, max_norm)
                 optimizer.step()
 
-            running += float(loss.item())
-            if step % log_every == 0:
-                bar.set_postfix(joint_loss=f"{running/max(1,log_every):.4f}")
-                running = 0.0
+            loss_f = float(loss.item())
+            running += loss_f
+            running_n += 1
+            epoch_sum += loss_f
+            epoch_n += 1
+            epoch_seen += B
+            global_step += 1
 
+            # --- wandb: step 단위 (비활성 시 no-op) ---
+            wandb_log({
+                "train/loss": loss_f,
+                "train/loss_is": float(loss_is.item()),
+                "train/loss_ig": float(loss_ig.item()),
+                "train/lr": optimizer.param_groups[0]["lr"],
+                "train/epoch": epoch,
+            }, step=global_step)
+
+            if step % log_every == 0:
+                # 실제 누적 스텝 수로 나눈다 (log_every로 나누면 step 0에서 50배 작게 보임)
+                bar.set_postfix(loss=f"{running/max(1,running_n):.4f}",
+                                is_=f"{float(loss_is.item()):.4f}",
+                                ig=f"{float(loss_ig.item()):.4f}")
+                running = 0.0
+                running_n = 0
+
+        bar.close()
+
+        # --- epoch 집계 ---
+        epoch_loss = epoch_sum / max(1, epoch_n)
+        epoch_time = time.time() - epoch_t0
+
+        # --- early stopping / best 판정 (train loss 기준) ---
+        improved = epoch_loss < (best_epoch_loss - min_delta)
+        if improved:
+            best_epoch_loss = epoch_loss
+            best_epoch = epoch
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+
+        epoch_metrics = {
+            "epoch/loss": epoch_loss,
+            "epoch/time_sec": epoch_time,
+            "epoch/samples_per_sec": epoch_seen / max(1e-9, epoch_time),
+            "epoch/index": epoch,
+            "epoch/best_loss": best_epoch_loss,
+            "epoch/epochs_no_improve": epochs_no_improve,
+        }
+        if device.type == "cuda":
+            epoch_metrics["epoch/peak_mem_alloc_GB"] = torch.cuda.max_memory_allocated(device) / 1024**3
+            epoch_metrics["epoch/peak_mem_reserved_GB"] = torch.cuda.max_memory_reserved(device) / 1024**3
+        wandb_log(epoch_metrics, step=global_step)
+
+        epoch_bar.set_postfix(loss=f"{epoch_loss:.4f}",
+                              best=f"{best_epoch_loss:.4f}@{best_epoch}",
+                              bad=epochs_no_improve)
+        print(f"[JOINT] Epoch {epoch}/{epochs} loss={epoch_loss:.4f} "
+              f"best={best_epoch_loss:.4f}@ep{best_epoch} no_improve={epochs_no_improve} "
+              f"({epoch_time:.1f}s, {epoch_seen/max(1e-9, epoch_time):.1f} samples/s)", flush=True)
+
+        # --- 저장: last는 항상, best는 개선됐을 때만 별도 디렉터리에 ---
         if save_dir:
             _save_all(save_dir, is_model.img_encoder, ig_model.gene_encoder, is_model.gcn)
+            if save_best and improved:
+                best_dir = os.path.join(save_dir, "best")
+                _save_all(best_dir, is_model.img_encoder, ig_model.gene_encoder, is_model.gcn)
+                print(f"[JOINT] best 갱신 → {best_dir} (epoch {epoch}, loss {epoch_loss:.4f})", flush=True)
 
-    print(f"Joint training (img↔spatial + img↔gene) done. ({time.time()-t0:.1f}s)")
+        # --- early stop ---
+        if early_stopping and epochs_no_improve >= patience:
+            stopped_early = True
+            print(f"[JOINT] Early stopping: {patience} epoch 동안 개선 없음 "
+                  f"(best={best_epoch_loss:.4f} @ epoch {best_epoch}).", flush=True)
+            epoch_bar.close()
+            break
+
+    if not stopped_early:
+        epoch_bar.close()
+
+    total_sec = time.time() - t0
+    wandb_summary(final_epoch_loss=epoch_loss,
+                  best_epoch_loss=best_epoch_loss,
+                  best_epoch=best_epoch,
+                  epochs_completed=epoch,
+                  stopped_early=stopped_early,
+                  total_train_sec=total_sec)
+    print(f"Joint training (img↔spatial + img↔gene) done. "
+          f"({total_sec:.1f}s, {epoch}/{epochs} epochs, best={best_epoch_loss:.4f} @ ep{best_epoch})")
     return is_model, ig_model

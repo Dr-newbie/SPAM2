@@ -42,6 +42,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import anndata as ad
 from tqdm import tqdm
 from torch.utils.data import DataLoader
@@ -62,7 +63,9 @@ from code.models.fusion import CrossModalFusion
 from code.models.decoders import ZINBDecoder
 from code.models.graph_construction import build_knn_graph
 from code.models.graph_construction_delaunay import build_delaunay_graph
+from code.models.spot_features import build_histology_node_features, make_spot_in_proj
 
+from code.utils.lora_utils import attach_lora_to_foundation
 from code.utils.dataset_utils import (
     load_h5ad_with_preproc,
     load_patch_mapping_csv_xenium,
@@ -75,6 +78,7 @@ from code.utils.image_representation_gathering import (
     ImageMapDataset,
     gather_image_representations,
     top1_cosine_match,
+    topk_cosine_match,
     _expression_matrix_for_spots,
 )
 
@@ -84,11 +88,20 @@ class CrossAttnZINBModel(nn.Module):
                  dim_fuse=512, num_heads=8, dropout=0.1, merge="gated-sum",
                  img_tokens=1, spot_tokens=1, gene_tokens=1,
                  decoder_hidden=1024, gene_dim=1000,
-                 num_celltypes: int = 0, cls_head_hidden: int = 0, cls_dropout: float = 0.0):
+                 num_celltypes: int = 0, cls_head_hidden: int = 0, cls_dropout: float = 0.0,
+                 dim_spot_in: int = 256, use_spot: bool = True, use_gene: bool = True):
         super().__init__()
         self.img_encoder = img_encoder
         self.gene_encoder = gene_encoder
         self.gcn = gcn
+        # modality ablation (R2): drop the spot (coords/GCN) and/or gene branch in fusion
+        self.use_spot = bool(use_spot)
+        self.use_gene = bool(use_gene)
+
+        # H(0) for the spatial GCN is the histology embedding of each spot,
+        # projected to the width the GCN was pretrained on.
+        self.dim_spot_in = int(dim_spot_in)
+        self.spot_in_proj = make_spot_in_proj(dim_img, dim_spot_in)
 
         self.proj_img = nn.Linear(dim_img, dim_fuse)
         self.proj_gene = nn.Linear(dim_gene, dim_fuse)
@@ -126,6 +139,19 @@ class CrossAttnZINBModel(nn.Module):
         else:
             self.cls_head = None
 
+    @torch.no_grad()
+    def build_spot_features(self, img_loader, n_nodes, device, amp_dtype=None):
+        """H(0) for every node: histology embedding -> spot_in_proj."""
+        return build_histology_node_features(
+            img_encoder=self.img_encoder,
+            loader=img_loader,
+            n_nodes=n_nodes,
+            out_dim=self.dim_spot_in,
+            device=device,
+            proj=self.spot_in_proj,
+            amp_dtype=amp_dtype,
+        )
+
     def forward(
         self,
         batch,
@@ -149,14 +175,17 @@ class CrossAttnZINBModel(nn.Module):
         zs = self.proj_spot(zs)
 
         if return_attn:
-            z_fused, _, _, attn = self.fusion(zi, zs, zg, return_attn=True)
+            z_fused, _, _, attn = self.fusion(zi, zs, zg, return_attn=True,
+                                              use_spot=self.use_spot, use_gene=self.use_gene)
         else:
-            z_fused, _, _ = self.fusion(zi, zs, zg, return_attn=False)
+            z_fused, _, _ = self.fusion(zi, zs, zg, return_attn=False,
+                                        use_spot=self.use_spot, use_gene=self.use_gene)
             attn = None
         mu, theta, pi = self.decoder(z_fused)
         cls_logits = self.cls_head(z_fused) if self.cls_head is not None else None
         if return_aux:
-            return mu, theta, pi, {"attn": attn, "cls_logits": cls_logits}
+            return mu, theta, pi, {"attn": attn, "cls_logits": cls_logits,
+                                   "zi": zi, "zg": zg, "zs": zs}
         if return_attn:
             return mu, theta, pi, attn
         return mu, theta, pi
@@ -175,39 +204,60 @@ def _strip_prefix(sd, prefix):
     return {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}
 
 
-def load_pretrained_blocks(foundation, gene_encoder, gcn,
+def _load_module_from_sd(module, sd, prefixes, name, path):
+    """
+    Load `module` from the first prefix that yields overlapping keys, failing
+    loudly on shape mismatch. load_state_dict(strict=False) still raises on a
+    size mismatch, so the old `except Exception: pass` around it silently left
+    modules randomly initialized whenever the architecture drifted.
+    """
+    tgt = module.state_dict()
+    for pfx in prefixes:
+        sub = _strip_prefix(sd, pfx) if pfx else dict(sd)
+        common = [k for k in sub if k in tgt]
+        if not common:
+            continue
+        bad = [(k, tuple(sub[k].shape), tuple(tgt[k].shape))
+               for k in common
+               if hasattr(sub[k], "shape") and sub[k].shape != tgt[k].shape]
+        if bad:
+            detail = "\n".join(f"    {k}: ckpt{a} vs model{b}" for k, a, b in bad[:8])
+            raise RuntimeError(
+                f"[PT] shape mismatch loading {name} from {path}:\n{detail}\n"
+                "  Check --pt_proj_dim / --spot_hidden_dim against the checkpoint."
+            )
+        ret = module.load_state_dict(sub, strict=False)
+        print(f"[PT] loaded {name} from {path} "
+              f"({len(common)}/{len(tgt)} tensors"
+              + (f", {len(ret.missing_keys)} left at init" if ret.missing_keys else "") + ")")
+        return True
+    raise RuntimeError(
+        f"[PT] no keys matching {name} found in {path}. Tried prefixes {prefixes!r}."
+    )
+
+
+def load_pretrained_blocks(foundation, gene_encoder, gcn, spot_in_proj=None,
                            pt_img_backbone=None, pt_ig=None, pt_is=None):
     if pt_img_backbone:
         sd = _load_sd(pt_img_backbone)
-        for cand in [_strip_prefix(sd, "img_encoder.foundation."),
-                     _strip_prefix(sd, "foundation."),
-                     sd]:
-            try:
-                foundation.load_state_dict(cand, strict=False)
-                print(f"[PT] foundation loaded from {pt_img_backbone} (strict=False)")
-                break
-            except Exception:
-                pass
+        _load_module_from_sd(
+            foundation, sd,
+            ["img_encoder.foundation.", "foundation.", ""],
+            "foundation", pt_img_backbone,
+        )
+        if spot_in_proj is not None and not isinstance(spot_in_proj, nn.Identity):
+            _load_module_from_sd(
+                spot_in_proj, sd, ["img_encoder.proj.", "proj."],
+                "spot_in_proj", pt_img_backbone,
+            )
 
     if pt_ig:
         sd = _load_sd(pt_ig)
-        for cand in [_strip_prefix(sd, "gene_encoder."), sd]:
-            try:
-                gene_encoder.load_state_dict(cand, strict=False)
-                print(f"[PT] gene_encoder loaded from {pt_ig} (strict=False)")
-                break
-            except Exception:
-                pass
+        _load_module_from_sd(gene_encoder, sd, ["gene_encoder.", ""], "gene_encoder", pt_ig)
 
     if pt_is:
         sd = _load_sd(pt_is)
-        for cand in [_strip_prefix(sd, "gcn."), sd]:
-            try:
-                gcn.load_state_dict(cand, strict=False)
-                print(f"[PT] gcn loaded from {pt_is} (strict=False)")
-                break
-            except Exception:
-                pass
+        _load_module_from_sd(gcn, sd, ["gcn.", ""], "spatial GCN", pt_is)
 
 
 def load_xattn_into_fusion(fusion: CrossModalFusion, xattn_path: str | None):
@@ -215,21 +265,25 @@ def load_xattn_into_fusion(fusion: CrossModalFusion, xattn_path: str | None):
         return
     sd = _load_sd(xattn_path)
 
-    def _load_block(dst_block: nn.Module, src_prefix: str):
-        sub = {k[len(src_prefix) + 1:]: v for k, v in sd.items() if k.startswith(src_prefix + ".")}
-        if not sub:
-            print(f"[XATTN][warn] no keys found for {src_prefix} in {xattn_path}")
+    def _load_block(dst_block: nn.Module, *src_prefixes: str):
+        for src_prefix in src_prefixes:
+            sub = {k[len(src_prefix) + 1:]: v for k, v in sd.items()
+                   if k.startswith(src_prefix + ".")}
+            if not sub:
+                continue
+            ret = dst_block.load_state_dict(sub, strict=False)
+            missing = len(ret.missing_keys)
+            unexpected = len(ret.unexpected_keys)
+            if missing or unexpected:
+                print(f"[XATTN][warn] {src_prefix} -> fusion (missing={missing}, unexpected={unexpected})")
+            else:
+                print(f"[XATTN] loaded {src_prefix} into fusion")
             return
-        ret = dst_block.load_state_dict(sub, strict=False)
-        missing = len(ret.missing_keys)
-        unexpected = len(ret.unexpected_keys)
-        if missing or unexpected:
-            print(f"[XATTN][warn] {src_prefix} -> fusion (missing={missing}, unexpected={unexpected})")
-        else:
-            print(f"[XATTN] loaded {src_prefix} into fusion")
+        print(f"[XATTN][warn] no keys found for {'/'.join(src_prefixes)} in {xattn_path}")
 
     _load_block(fusion.xa_ig, "i2g")
-    _load_block(fusion.xa_is, "i2c")
+    # "i2s" is the current name; "i2c" is the pre-rename (coordinate-era) key.
+    _load_block(fusion.xa_is, "i2s", "i2c")
 
 
 def select_device(device_arg: str) -> torch.device:
@@ -335,6 +389,30 @@ def _infer_cls_head_config(sd: dict | None) -> tuple[int, int]:
     return 0, 0
 
 
+def _infer_lora_config(sd: dict | None) -> tuple[bool, int]:
+    """Detect a LoRA-adapted image backbone from finetune-checkpoint key names.
+
+    A --with_lora stage-2 run saves the encoder as PEFT rewrote it: every adapted
+    Linear becomes '<name>.base_layer.weight' plus '<name>.lora_A.default.weight'
+    of shape (r, in_features) and '<name>.lora_B.default.weight' of shape
+    (out_features, r). r is therefore recoverable from the checkpoint itself.
+
+    alpha is NOT. It lives in LoraConfig and only reaches the weights through the
+    alpha/r scaling applied in forward, so it has to come from the caller
+    (--lora_alpha). A wrong value silently rescales every adapted layer instead
+    of failing, which is why the default here matches the stage-2 trainer's.
+    """
+    if not isinstance(sd, dict):
+        return False, 0
+    ranks = {int(v.shape[0]) for k, v in sd.items()
+             if ".lora_A." in k and getattr(v, "ndim", 0) == 2}
+    if not ranks:
+        return False, 0
+    if len(ranks) > 1:
+        print(f"[LoRA][warn] checkpoint mixes ranks {sorted(ranks)}; using max")
+    return True, max(ranks)
+
+
 @torch.no_grad()
 def _predict_celltype_probs_from_base_expr(
     model: nn.Module,
@@ -352,6 +430,18 @@ def _predict_celltype_probs_from_base_expr(
     model.eval()
     num_nodes = int(expr_base_np.shape[0])
     num_ct = int(model.num_celltypes)
+    # Crash-resume cache (same knob as SpotFeat): this stage costs ~1h on 1M+
+    # cells and the box loses power mid-run.
+    _cdir = os.environ.get("SPAM_SPOTFEAT_CACHE")
+    _cpath = os.path.join(_cdir, f"ctprobs_{num_nodes}x{num_ct}.npy") if _cdir else None
+    if _cpath and os.path.isfile(_cpath):
+        try:
+            arr = np.load(_cpath)
+            if arr.shape == (num_nodes, num_ct) and np.isfinite(arr).all():
+                print(f"[cache] celltype probs hit: {_cpath}")
+                return arr
+        except Exception as e:
+            print(f"[cache] celltype probs unreadable ({e}), rebuilding: {_cpath}")
     probs_all = np.zeros((num_nodes, num_ct), dtype=np.float32)
     expr_base_t = torch.from_numpy(expr_base_np).to(device)
 
@@ -374,7 +464,119 @@ def _predict_celltype_probs_from_base_expr(
             raise RuntimeError("cls_logits is None from model; check cls_head configuration.")
         probs = torch.softmax(logits.float(), dim=1).detach().cpu().numpy()
         probs_all[idxs.detach().cpu().numpy()] = probs
+    if _cpath:
+        np.save(_cpath, probs_all)
+        print(f"[cache] celltype probs saved: {_cpath}")
     return probs_all
+
+
+# ---- SPAM's ACTUAL retrieval (ported from the finetune
+# run_finetunning_xattn_withceltype_0214_retrieval_final_version.py):
+# per-query entropy-adaptive tau, celltype-probability quota over clusters,
+# then a pure cosine-softmax WEIGHTED SUM of the selected bank expression.
+# This is the mechanism the manuscript reports; the celltype-top-1 copy is only
+# a simplification that the obsbank inference happened to use. ----
+def _per_query_tau_np(query_probs, tau_base, tau_alpha):
+    p = np.clip(np.asarray(query_probs, dtype=np.float64), 1e-9, None)
+    C = p.shape[1]
+    H = -(p * np.log(p)).sum(1)
+    Hn = H / (np.log(C) if C > 1 else 1.0)
+    return np.clip(tau_base * (1.0 + tau_alpha * Hn), 1e-3, 50.0)
+
+
+def _allocate_cluster_counts(prob_vec, total):
+    total = int(max(total, 0))
+    if total == 0:
+        return np.zeros_like(prob_vec, dtype=np.int64)
+    p = np.clip(np.asarray(prob_vec, dtype=np.float64), 0.0, None)
+    s = float(p.sum())
+    p = p / s if s > 0 else np.ones_like(p) / max(int(p.size), 1)
+    raw = p * float(total)
+    cnt = np.floor(raw).astype(np.int64)
+    rem = int(total - int(cnt.sum()))
+    if rem > 0:
+        order = np.argsort(-(raw - cnt.astype(np.float64)))
+        cnt[order[:rem]] += 1
+    return cnt
+
+
+@torch.no_grad()
+def weighted_retrieval_expr(test_rep, pred_probs, train_rep, expr_train, class_to_train,
+                            bank_size=5000, tau_base=0.07, tau_alpha=0.3,
+                            device="cuda", sim_chunk=512):
+    # GPU-resident to avoid per-query host<->device syncs. expr_bank and the
+    # per-class candidate index tensors live on-device; only the finished chunk
+    # of predictions is copied back to host.
+    dev = torch.device(device)
+    q = F.normalize(torch.from_numpy(np.ascontiguousarray(test_rep, np.float32)).to(dev), dim=1)
+    bank = F.normalize(torch.from_numpy(np.ascontiguousarray(train_rep, np.float32)).to(dev), dim=1)
+    B, N = q.size(0), bank.size(0)
+    target = int(min(bank_size, N))
+    probs = np.asarray(pred_probs, dtype=np.float64)
+    tau_q = torch.from_numpy(_per_query_tau_np(probs, tau_base, tau_alpha).astype(np.float32)).to(dev)
+    # expr_bank can be huge (e.g. ovarian 1.16M x 1833 = 8.5 GB); on a SHARED GPU
+    # keep it on the device only if it comfortably fits, else gather on CPU.
+    expr_np = np.ascontiguousarray(expr_train, np.float32)
+    G = expr_np.shape[1]
+    expr_bytes = expr_np.nbytes
+    # Decide GPU vs CPU by ACTUAL free device memory, not a fixed cap: the CPU
+    # gather path is ~50x slower (per-query host<->device sync), so use the GPU
+    # whenever the bank fits with a safety margin.
+    use_gpu_expr = False
+    if dev.type == "cuda":
+        try:
+            free_b, _ = torch.cuda.mem_get_info(dev)
+        except Exception:
+            free_b = 0
+        use_gpu_expr = expr_bytes < 0.7 * free_b
+        print(f"[weighted] expr_bank {expr_bytes/1e9:.1f}GB, GPU free {free_b/1e9:.1f}GB "
+              f"-> {'GPU' if use_gpu_expr else 'CPU (gather)'}")
+    else:
+        print(f"[weighted] expr_bank {expr_bytes/1e9:.1f}GB on CPU (gather)")
+    expr_gpu = torch.from_numpy(expr_np).to(dev) if use_gpu_expr else None
+    cmap = {int(c): torch.as_tensor(np.asarray(v, np.int64), device=dev, dtype=torch.long)
+            for c, v in class_to_train.items() if len(v) > 0}
+    out = np.zeros((B, G), dtype=np.float32)
+    for s in tqdm(range(0, B, sim_chunk), desc=f"weighted-retr(bank={target})", leave=False):
+        e = min(B, s + sim_chunk)
+        sim = q[s:e] @ bank.t()                       # (chunk, N) fp32, on GPU
+        buf = torch.empty((e - s, G), device=dev, dtype=torch.float32)
+        for j in range(e - s):
+            bi = s + j
+            sim_bi = sim[j]                           # (N,) GPU
+            quota = _allocate_cluster_counts(probs[bi], target)
+            parts = []
+            for ci in np.nonzero(quota)[0]:
+                cand = cmap.get(int(ci))
+                if cand is None:
+                    continue
+                kk = min(int(quota[ci]), int(cand.numel()))
+                if kk <= 0:
+                    continue
+                _, loc = torch.topk(sim_bi[cand], kk)
+                parts.append(cand.index_select(0, loc))
+            sel = torch.unique(torch.cat(parts)) if parts else torch.empty(0, dtype=torch.long, device=dev)
+            if int(sel.numel()) < target:             # stage-2 global fill
+                sf = sim_bi if sel.numel() == 0 else sim_bi.clone().index_fill_(0, sel, -1e9)
+                need = min(target - int(sel.numel()), int(sf.numel()))
+                if need > 0:
+                    _, fi = torch.topk(sf, need)
+                    sel = fi if sel.numel() == 0 else torch.cat([sel, fi])
+            if sel.numel() == 0:
+                _, sel = torch.topk(sim_bi, min(target, N))
+            ss = sim_bi.index_select(0, sel)
+            if int(ss.numel()) > target:
+                vs, ls = torch.topk(ss, target); sel = sel.index_select(0, ls); ss = vs
+            w = torch.softmax(ss / tau_q[bi], dim=0)  # (k,)
+            if use_gpu_expr:
+                buf[j] = (w.unsqueeze(-1) * expr_gpu.index_select(0, sel)).sum(0)
+            else:
+                w_np = w.detach().cpu().numpy()
+                sel_np = sel.detach().cpu().numpy()
+                out[bi] = (w_np[:, None] * expr_np[sel_np]).sum(0)
+        if use_gpu_expr:
+            out[s:e] = buf.cpu().numpy()
+    return out
 
 
 def predict_expression_by_celltype_similarity(
@@ -395,11 +597,24 @@ def predict_expression_by_celltype_similarity(
     img_encoder: nn.Module | None = None,
     min_conf: float = 0.0,
     fallback: str = "similarity",
+    test_image_transform: nn.Module | None = None,
+    bank_subsample: int | None = None,
+    bank_seed: int = 0,
+    ablation: bool = False,
+    topk: int = 10,
+    tau: float = 0.07,
+    weighted: bool = False,
+    w_bank_size: int = 5000,
+    w_tau_base: float = 0.07,
+    w_tau_alpha: float = 0.3,
 ) -> dict:
     if test_map_df is None:
         raise ValueError("test_map_df is required for similarity matching.")
     if img_encoder is None:
         raise ValueError("img_encoder is required for celltype-aware similarity.")
+    # E7 rotation: test queries may use a rotated transform; train bank never rotates.
+    if test_image_transform is None:
+        test_image_transform = image_transform
 
     device_t = torch.device(device)
     train_map_df = align_map_ids_to_obs(adata, train_map_df, id_col="spot_id")
@@ -419,7 +634,7 @@ def predict_expression_by_celltype_similarity(
         drop_last=False,
     )
     test_loader = DataLoader(
-        ImageMapDataset(test_map_df, image_transform=image_transform, id_col="spot_id"),
+        ImageMapDataset(test_map_df, image_transform=test_image_transform, id_col="spot_id"),
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
@@ -427,14 +642,45 @@ def predict_expression_by_celltype_similarity(
         drop_last=False,
     )
 
-    train_rep, train_ids = gather_image_representations(
-        img_encoder, train_loader, device=device_t, amp_dtype=amp_dtype, normalize=True,
-        show_progress=True, desc="embed(train)"
-    )
-    test_rep, test_ids = gather_image_representations(
-        img_encoder, test_loader, device=device_t, amp_dtype=amp_dtype, normalize=True,
-        show_progress=True, desc="embed(test)"
-    )
+    # Crash-resume cache for the embedding passes: the machine has died in the
+    # similarity stage repeatedly, so persist the (deterministic, frozen-model)
+    # embeddings and resume there instead of recomputing hours of forwards.
+    _cdir = os.environ.get("SPAM_SPOTFEAT_CACHE")
+
+    def _cached_embed(loader, n_rows, tag, desc):
+        path = os.path.join(_cdir, f"emb_{tag}_{n_rows}.npz") if _cdir else None
+        if path and os.path.isfile(path):
+            try:
+                z = np.load(path, allow_pickle=True)
+                rep, ids = z["rep"], [str(s) for s in z["ids"]]
+                if rep.shape[0] == n_rows and np.isfinite(rep).all():
+                    print(f"[cache] {desc} hit: {path}")
+                    return rep, ids
+                print(f"[cache] {desc} invalid, rebuilding: {path}")
+            except Exception as e:
+                print(f"[cache] {desc} unreadable ({e}), rebuilding: {path}")
+        rep, ids = gather_image_representations(
+            img_encoder, loader, device=device_t, amp_dtype=amp_dtype, normalize=True,
+            show_progress=True, desc=desc,
+        )
+        if path:
+            np.savez(path, rep=rep, ids=np.asarray(ids, dtype=object))
+            print(f"[cache] {desc} saved: {path}")
+        return rep, ids
+
+    train_rep, train_ids = _cached_embed(train_loader, len(train_map_df), "train", "embed(train)")
+    test_rep, test_ids = _cached_embed(test_loader, len(test_map_df), "test", "embed(test)")
+
+    # R2-4 bank ablation: randomly keep `bank_subsample` cells in the retrieval
+    # bank (train_rep + celltypes + spot_ids + expr all restricted consistently).
+    if bank_subsample is not None and 0 < bank_subsample < len(train_rep):
+        rng = np.random.default_rng(bank_seed)
+        keep = np.sort(rng.choice(len(train_rep), int(bank_subsample), replace=False))
+        train_rep = train_rep[keep]
+        train_celltypes = np.asarray(train_celltypes, dtype=object)[keep]
+        train_spot_ids = [train_spot_ids[i] for i in keep]
+        train_map_df = train_map_df.iloc[keep].reset_index(drop=True)
+        print(f"[bank] subsampled retrieval bank to {len(train_rep)} cells (seed={bank_seed})")
     if pred_celltype_probs.shape[0] != test_rep.shape[0]:
         raise ValueError(
             f"pred_celltype_probs rows ({pred_celltype_probs.shape[0]}) "
@@ -483,7 +729,17 @@ def predict_expression_by_celltype_similarity(
         used_ct_constraint[test_sel] = True
 
     expr_train = _expression_matrix_for_spots(adata, train_spot_ids)
-    pred_expr = expr_train[selected_idx].astype(np.float32)
+    if weighted:
+        # SPAM's actual retrieval: prob-quota + cosine-softmax weighted sum.
+        print(f"[retrieval] WEIGHTED (bank={w_bank_size}, tau_base={w_tau_base}, "
+              f"tau_alpha={w_tau_alpha}) — SPAM's trained mechanism")
+        pred_expr = weighted_retrieval_expr(
+            test_rep, pred_celltype_probs, train_rep, np.asarray(expr_train, np.float32),
+            class_to_train, bank_size=w_bank_size, tau_base=w_tau_base, tau_alpha=w_tau_alpha,
+            device=sim_device if sim_device != "cpu" else "cpu", sim_chunk=sim_chunk,
+        )
+    else:
+        pred_expr = expr_train[selected_idx].astype(np.float32)
     if fallback == "mean":
         fallback_mask = ~used_ct_constraint
         if fallback_mask.any():
@@ -491,6 +747,39 @@ def predict_expression_by_celltype_similarity(
 
     matched_train_spot_ids = np.asarray(train_spot_ids, dtype=object)[selected_idx]
     matched_train_celltype = train_celltypes[selected_idx]
+
+    # Retrieval-strategy ablation (R2): compute alternative aggregations in the
+    # same pass, reusing train_rep/test_rep/expr_train. Strategies:
+    #   global_top1      = expr of single nearest bank cell (no celltype)
+    #   global_topk      = softmax(sim/tau)-weighted mean of top-K nearest (no celltype)
+    #   global_mean      = mean over the whole bank (no retrieval)
+    #   celltype_centroid= mean over the predicted celltype's bank cells
+    #   celltype_top1    = current SPAM (pred_expr, celltype-constrained top-1)
+    ablation_preds = None
+    if ablation:
+        gmean = _mean_gene_vector(adata).astype(np.float32)
+        # global top-1
+        p_g1 = expr_train[global_idx].astype(np.float32)
+        # global top-K weighted
+        tk_idx, tk_sim = topk_cosine_match(
+            train_rep, test_rep, k=topk, chunk_size=sim_chunk,
+            device=sim_device, show_progress=True, desc=f"topk={topk}(global)")
+        w = np.exp((tk_sim - tk_sim.max(1, keepdims=True)) / float(tau))
+        w = (w / w.sum(1, keepdims=True)).astype(np.float32)          # (N,K)
+        p_gk = np.einsum("nk,nkg->ng", w, expr_train[tk_idx].astype(np.float32)).astype(np.float32)
+        # celltype centroid (mean expr within predicted celltype; fallback=global mean)
+        ct_cent = np.repeat(gmean[None, :], len(celltype_names), axis=0).astype(np.float32)
+        for ci in range(len(celltype_names)):
+            inds = class_to_train.get(ci, np.array([], dtype=np.int64))
+            if inds.size: ct_cent[ci] = expr_train[inds].mean(0)
+        p_cc = ct_cent[pred_ct_idx].astype(np.float32)
+        # global mean
+        p_gm = np.repeat(gmean[None, :], test_rep.shape[0], axis=0).astype(np.float32)
+        ablation_preds = {
+            "global_top1": p_g1, "global_topk": p_gk,
+            "global_mean": p_gm, "celltype_centroid": p_cc,
+            "celltype_top1": pred_expr,
+        }
 
     matched_meta = None
     if meta_cols:
@@ -511,6 +800,7 @@ def predict_expression_by_celltype_similarity(
         "pred_celltype_name": pred_ct_name,
         "pred_celltype_conf": pred_ct_conf,
         "used_celltype_constraint": used_ct_constraint.astype(np.int64),
+        "ablation_preds": ablation_preds,
         "test_ids": test_ids,
         "train_ids": train_ids,
         "train_spot_ids": train_spot_ids,
@@ -539,19 +829,38 @@ def main():
     ap.add_argument("--proj_dim_spot", type=int, default=256)
     ap.add_argument("--fuse_dim", type=int, default=512)
     ap.add_argument("--heads", type=int, default=8)
-    ap.add_argument("--img_tokens", type=int, default=1,
+    ap.add_argument("--img_tokens", type=int, default=10,   # Supp.: 10
                     help="number of image query tokens in fusion cross-attention")
-    ap.add_argument("--spot_tokens", type=int, default=1,
+    ap.add_argument("--spot_tokens", type=int, default=10,
                     help="number of spatial tokens in fusion cross-attention")
-    ap.add_argument("--gene_tokens", type=int, default=1,
+    ap.add_argument("--gene_tokens", type=int, default=10,
                     help="number of gene tokens in fusion cross-attention")
     ap.add_argument("--dropout", type=float, default=0.1)
     ap.add_argument("--merge", default="gated-sum", choices=["gated-sum", "concat-proj"])
+    ap.add_argument("--modalities", default="all",
+                    choices=["all", "image", "image+coords", "image+gene"],
+                    help="modality ablation (R2): all=image+coords+gene; "
+                         "image=image only; image+coords=drop gene; image+gene=drop coords")
 
-    ap.add_argument("--graph_type", default="knn", choices=["knn", "delaunay"])
+    ap.add_argument("--graph_type", default="delaunay", choices=["knn", "delaunay"],
+                    help="Must match the graph used at finetuning time.")
     ap.add_argument("--k", type=int, default=12)
+    ap.add_argument("--pt_proj_dim", type=int, default=256,
+                    help="Pretraining --proj_dim: width of H(0) and of the "
+                         "spatial GCN input. Must match the finetuned model.")
+    ap.add_argument("--spot_hidden_dim", type=int, default=256,
+                    help="Hidden width of the spatial GCN; must match finetuning.")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--amp", action="store_true")
+
+    ap.add_argument("--lora_alpha", type=int, default=32,
+                    help="LoRA alpha used at stage 2. Not stored in the checkpoint, "
+                         "so it must match the training run (trainer default: 32).")
+    ap.add_argument("--lora_r", type=int, default=0,
+                    help="LoRA rank override; 0 = infer from the checkpoint.")
+    ap.add_argument("--no_lora", action="store_true",
+                    help="Skip LoRA attachment even if the checkpoint carries adapters "
+                         "(evaluates the un-adapted backbone; for ablation only).")
 
     ap.add_argument("--ft_model_ckpt", default=None, help="finetune된 전체 모델 ckpt (model.pt)")
     ap.add_argument("--pt_img_backbone", default=None, help="pretrained image backbone ckpt")
@@ -561,8 +870,34 @@ def main():
 
     ap.add_argument("--batch_size", type=int, default=256)
     ap.add_argument("--num_workers", type=int, default=8)
+    ap.add_argument("--rotate_test", type=int, default=0, choices=[0, 90, 180, 270],
+                    help="E7: rotate ONLY test query patches by this many degrees "
+                         "(loss-less PIL transpose). Train bank never rotates.")
+    ap.add_argument("--hflip_test", action="store_true",
+                    help="E7: horizontal-flip test query patches.")
+    ap.add_argument("--bank_subsample", type=int, default=None,
+                    help="R2-4: randomly keep this many cells in the retrieval bank.")
+    ap.add_argument("--bank_seed", type=int, default=0,
+                    help="R2-4: RNG seed for bank subsampling.")
 
     ap.add_argument("--expr_source", default="mean", choices=["mean", "similarity", "celltype_similarity"])
+    ap.add_argument("--weighted_retrieval", action="store_true",
+                    help="Use SPAM's ACTUAL trained retrieval (celltype-prob quota + "
+                         "cosine-softmax weighted sum) instead of the simplified top-1 copy. "
+                         "Matches the manuscript-reported mechanism.")
+    ap.add_argument("--w_bank_size", type=int, default=5000)
+    ap.add_argument("--w_tau_base", type=float, default=0.07)
+    ap.add_argument("--w_tau_alpha", type=float, default=0.3)
+    ap.add_argument("--retrieval_ablation", action="store_true",
+                    help="R2: with --expr_source celltype_similarity, also compute & save 5 "
+                         "aggregation strategies (global top-1/top-K/mean, celltype centroid/top-1) "
+                         "to <out>_retrieval_ablation.npz")
+    ap.add_argument("--retr_topk", type=int, default=10, help="K for global top-K weighted strategy")
+    ap.add_argument("--retr_tau", type=float, default=0.07, help="softmax temperature for top-K weights")
+    ap.add_argument("--keep_control_probes", action="store_true",
+                    help="Build the model on the FULL panel (do not drop control probes). "
+                         "Required to match finetune checkpoints trained on the 541-gene panel; "
+                         "otherwise gene_encoder/cls_head shape-mismatch and celltype prediction corrupts.")
     ap.add_argument("--sim_chunk", type=int, default=1024)
     ap.add_argument("--sim_device", default="cpu")
     ap.add_argument("--sim_batch_size", type=int, default=None)
@@ -585,6 +920,9 @@ def main():
     )
 
     ap.add_argument("--out_h5ad", required=True)
+    ap.add_argument("--dump_embeddings", type=str, default=None,
+                    help="If set, dump per-cell projected z_img/z_gene/z_sp (from true expr) "
+                         "to this .npz and exit before retrieval (for the alignment UMAP).")
     ap.add_argument("--save_attn", action="store_true",
                     help="save attention weights during inference")
     ap.add_argument("--attn_out_dir", default=None,
@@ -607,11 +945,14 @@ def main():
         os.makedirs(attn_out_dir, exist_ok=True)
         print(f"[AttnSave] dir={attn_out_dir} max_batches={args.attn_max_batches}")
 
+    _drop_ctrl = not args.keep_control_probes
     eval_adata = load_h5ad_with_preproc(
-        args.h5ad, use_hvg=False, n_top_genes=None, x_key="x_centroid", y_key="y_centroid"
+        args.h5ad, use_hvg=False, n_top_genes=None, x_key="x_centroid", y_key="y_centroid",
+        drop_controls=_drop_ctrl,
     )
     train_adata = load_h5ad_with_preproc(
-        args.train_h5ad, use_hvg=False, n_top_genes=None, x_key="x_centroid", y_key="y_centroid"
+        args.train_h5ad, use_hvg=False, n_top_genes=None, x_key="x_centroid", y_key="y_centroid",
+        drop_controls=_drop_ctrl,
     )
     train_adata, eval_adata = align_genes_for_inference(train_adata, eval_adata)
 
@@ -633,11 +974,30 @@ def main():
     foundation.precision = amp_dtype
     image_tf = getattr(foundation, "eval_transforms", None)
 
+    # E7: build a test-only rotated transform (loss-less PIL transpose then the
+    # foundation eval transform). Train bank keeps `image_tf` unrotated.
+    test_image_tf = image_tf
+    if args.rotate_test or args.hflip_test:
+        from PIL import Image as _PILImage
+        _ops = []
+        if args.rotate_test:
+            _ops.append({90: _PILImage.ROTATE_90, 180: _PILImage.ROTATE_180,
+                         270: _PILImage.ROTATE_270}[args.rotate_test])
+        if args.hflip_test:
+            _ops.append(_PILImage.FLIP_LEFT_RIGHT)
+
+        def _rot_tf(img, _base=image_tf, _ops=_ops):
+            for op in _ops:
+                img = img.transpose(op)
+            return _base(img)
+        test_image_tf = _rot_tf
+        print(f"[E7] test queries rotated: rotate={args.rotate_test} hflip={args.hflip_test}")
+
     img_loader = make_img_only_dataloader(
         map_df=map_df_aligned,
         batch_size=max(1, args.batch_size),
         num_workers=max(1, args.num_workers),
-        image_transform=image_tf,
+        image_transform=test_image_tf,
         shuffle=False,
     )
 
@@ -648,10 +1008,12 @@ def main():
 
     img_dim = foundation.get_output_dim()
     gene_dim = eval_adata.n_vars
-    spot_feat_in = torch.from_numpy(coords_np).float().to(device)
+    n_nodes = int(coords_np.shape[0])
+    # Coordinates define the graph edges only; H(0) is built from histology
+    # once the encoder weights are in place (after the ft checkpoint is loaded).
     gene_encoder = GeneEncoder(input_dim=gene_dim, model_size_omic="small",
                                proj_dim=args.proj_dim_gene, normalize=False)
-    gcn = SpatialGCN(in_dim=spot_feat_in.size(1), hidden_dim=256,
+    gcn = SpatialGCN(in_dim=args.pt_proj_dim, hidden_dim=args.spot_hidden_dim,
                      out_dim=args.proj_dim_spot, dropout=0.2)
 
     load_pretrained_blocks(
@@ -663,6 +1025,24 @@ def main():
 
     ft_sd = _load_sd(args.ft_model_ckpt) if args.ft_model_ckpt else None
     ckpt_num_ct, ckpt_ct_hidden = _infer_cls_head_config(ft_sd)
+
+    # A --with_lora checkpoint only lines up with a backbone that has the same
+    # adapters injected. Attach them here — after load_pretrained_blocks, whose
+    # pt_* state dicts use the pre-PEFT names, and before the full checkpoint is
+    # applied below.
+    ckpt_has_lora, ckpt_lora_r = _infer_lora_config(ft_sd)
+    if ckpt_has_lora and not args.no_lora:
+        lora_r = args.lora_r if args.lora_r > 0 else ckpt_lora_r
+        foundation = attach_lora_to_foundation(
+            foundation, backbone_name=args.enc_name,
+            r=lora_r, alpha=args.lora_alpha, dropout=0.0, bias="none",
+        )
+        r_src = "--lora_r" if args.lora_r > 0 else "checkpoint"
+        print(f"[LoRA] adapters attached: r={lora_r} (from {r_src}), "
+              f"alpha={args.lora_alpha}, scaling={args.lora_alpha / max(lora_r, 1):.3f}")
+    elif ckpt_has_lora:
+        print("[LoRA][warn] --no_lora set: checkpoint adapters (r="
+              f"{ckpt_lora_r}) will be dropped")
 
     celltype_meta_path = args.celltype_meta_pt
     if celltype_meta_path is None and args.ft_model_ckpt:
@@ -698,7 +1078,24 @@ def main():
         num_celltypes=num_celltypes,
         cls_head_hidden=cls_head_hidden,
         cls_dropout=0.0,
-    ).to(device)
+        dim_spot_in=args.pt_proj_dim,
+        use_spot=args.modalities in ("all", "image+coords"),
+        use_gene=args.modalities in ("all", "image+gene"),
+    )
+    if args.modalities != "all":
+        print(f"[modality-ablation] modalities={args.modalities} "
+              f"(use_spot={model.use_spot}, use_gene={model.use_gene})")
+
+    # spot_in_proj lives inside the model, so it is loaded here rather than in
+    # load_pretrained_blocks above (which must run before the LoRA attach, since
+    # the pt_* state dicts use pre-PEFT names). A full --ft_model_ckpt overrides
+    # it below; this only matters when running from block checkpoints.
+    if args.pt_img_backbone and not isinstance(model.spot_in_proj, nn.Identity):
+        _load_module_from_sd(
+            model.spot_in_proj, _load_sd(args.pt_img_backbone),
+            ["img_encoder.proj.", "proj."], "spot_in_proj", args.pt_img_backbone,
+        )
+    model = model.to(device)
 
     if args.pt_xattn:
         load_xattn_into_fusion(model.fusion, args.pt_xattn)
@@ -706,12 +1103,40 @@ def main():
     if args.ft_model_ckpt:
         sd = ft_sd if ft_sd is not None else _load_sd(args.ft_model_ckpt)
         try:
-            model.load_state_dict(sd, strict=False)
-            print(f"[FT] loaded full model state from {args.ft_model_ckpt} (strict=False)")
+            incompatible = model.load_state_dict(sd, strict=False)
+            missing = list(incompatible.missing_keys)
+            unexpected = list(incompatible.unexpected_keys)
+            print(f"[FT] loaded full model state from {args.ft_model_ckpt} "
+                  f"(strict=False): {len(sd)} ckpt tensors, "
+                  f"{len(missing)} missing, {len(unexpected)} unexpected")
+
+            # strict=False is deliberate (cls_head/decoder shapes differ across
+            # runs), but it also means an architecture mismatch produces no error
+            # at all — a LoRA checkpoint loaded into an un-adapted backbone lands
+            # here with all 384 img_encoder keys unexpected and silently scores
+            # the raw pretrained encoder. Surface that instead of hiding it.
+            for label, keys in (("missing", missing), ("unexpected", unexpected)):
+                enc_keys = [k for k in keys if k.startswith("img_encoder.")]
+                if enc_keys:
+                    print(f"[FT][warn] {len(enc_keys)} {label} img_encoder keys, "
+                          f"e.g. {enc_keys[:3]}")
+            if any(".lora_A." in k for k in unexpected):
+                raise SystemExit(
+                    "ABORT: the checkpoint carries LoRA adapters but the model "
+                    "has none, so the image encoder would silently fall back to "
+                    "base weights. Re-run without --no_lora."
+                )
         except Exception as e:
             print(f"[FT][warn] failed to load full model from {args.ft_model_ckpt}: {e}")
 
     model.eval()
+
+    # H(0) for the spatial GCN — built with the final (post-checkpoint) encoder
+    # so it reproduces exactly what finetuning fed the GCN.
+    spot_feat_in = model.build_spot_features(
+        img_loader=img_loader, n_nodes=n_nodes,
+        device=device, amp_dtype=amp_dtype if args.amp else torch.float32,
+    )
 
     sim_out = None
     gene_mean = _mean_gene_vector(train_adata)
@@ -806,6 +1231,34 @@ def main():
                 amp=args.amp,
                 amp_dtype=amp_dtype,
             )
+            if args.dump_embeddings:
+                print(f"[dump] extracting z_img/z_gene/z_sp (true expr) -> {args.dump_embeddings}", flush=True)
+                model.eval()
+                N_d = int(expr_base_for_ct.shape[0])
+                expr_t = torch.from_numpy(expr_base_for_ct).to(device)
+                idx_l, zi_l, zg_l, zs_l = [], [], [], []
+                with torch.no_grad():
+                    for bimg in tqdm(img_loader, desc="dump emb", leave=False):
+                        if isinstance(bimg, dict):
+                            imgs = bimg["image"].to(device); idxs = bimg["idx"].to(device).long()
+                        else:
+                            imgs, idxs = bimg; imgs = imgs.to(device); idxs = idxs.to(device).long()
+                        b = {"image": imgs, "expr": expr_t[idxs], "idx": idxs}
+                        with torch.autocast(device_type="cuda", dtype=amp_dtype,
+                                            enabled=(device.type == "cuda" and args.amp)):
+                            _, _, _, aux_d = model(b, spot_feat_in, edge_index, edge_weight, return_aux=True)
+                        idx_l.append(idxs.cpu().numpy())
+                        zi_l.append(aux_d["zi"].float().cpu().numpy())
+                        zg_l.append(aux_d["zg"].float().cpu().numpy())
+                        zs_l.append(aux_d["zs"].float().cpu().numpy())
+                allidx = np.concatenate(idx_l)
+                ZI = np.zeros((N_d, zi_l[0].shape[1]), np.float32); ZI[allidx] = np.concatenate(zi_l)
+                ZG = np.zeros((N_d, zg_l[0].shape[1]), np.float32); ZG[allidx] = np.concatenate(zg_l)
+                ZS = np.zeros((N_d, zs_l[0].shape[1]), np.float32); ZS[allidx] = np.concatenate(zs_l)
+                ids_d = map_df_aligned["spot_id"].astype(str).to_numpy()
+                np.savez(args.dump_embeddings, zi=ZI, zg=ZG, zs=ZS, ids=np.asarray(ids_d, dtype=object))
+                print(f"[dump] saved {args.dump_embeddings}  zi{ZI.shape} zg{ZG.shape} zs{ZS.shape}", flush=True)
+                import sys as _sys; _sys.exit(0)
             pred_idx_dbg = np.argmax(pred_ct_probs, axis=1).astype(np.int64)
             u_dbg, c_dbg = np.unique(pred_idx_dbg, return_counts=True)
             order_dbg = np.argsort(-c_dbg)
@@ -832,11 +1285,31 @@ def main():
                 sim_device=args.sim_device,
                 meta_cols=meta_cols,
                 image_transform=image_tf,
+                test_image_transform=test_image_tf,
                 img_encoder=model.img_encoder,
                 min_conf=args.celltype_min_conf,
                 fallback=args.celltype_fallback,
+                bank_subsample=args.bank_subsample,
+                bank_seed=args.bank_seed,
+                weighted=args.weighted_retrieval,
+                w_bank_size=args.w_bank_size,
+                w_tau_base=args.w_tau_base,
+                w_tau_alpha=args.w_tau_alpha,
+                ablation=args.retrieval_ablation,
+                topk=args.retr_topk,
+                tau=args.retr_tau,
             )
             expr_matrix = sim_out["pred_expression"]
+            if args.retrieval_ablation and sim_out.get("ablation_preds"):
+                import os as _os
+                ap = sim_out["ablation_preds"]
+                stem = _os.path.splitext(args.out_h5ad)[0]
+                outp = f"{stem}_retrieval_ablation.npz"
+                np.savez(outp,
+                         test_ids=np.asarray(sim_out["test_ids"], dtype=object),
+                         gene_names=np.asarray(list(train_adata.var_names), dtype=object),
+                         **{k: v.astype(np.float32) for k, v in ap.items()})
+                print(f"[retrieval-ablation] saved 5 strategies -> {outp}")
 
     preds = []
     expr_matrix_t = torch.from_numpy(expr_matrix).to(device)
@@ -866,7 +1339,11 @@ def main():
                 else:
                     mu, theta, pi = model(batch, spot_feat_in, edge_index, edge_weight, return_attn=False)
                     attn_map = None
-            preds.append(mu.detach().cpu())
+            # Store log1p(mu): the finetuning evaluation scores in log1p(CP10K)
+            # space (eval_epoch: yhat_log = log1p(clamp(mu))), and every metric
+            # in the manuscript is computed there. Saving raw mu put predictions
+            # on a different scale from every downstream consumer.
+            preds.append(torch.log1p(torch.clamp(mu, min=0.0)).detach().cpu())
             if dump_attn_this_batch and attn_map is not None:
                 out_npz = os.path.join(attn_out_dir, f"infer_step{step:04d}.npz")
                 _save_attn_npz(
@@ -910,6 +1387,36 @@ def main():
 
     rec.write(args.out_h5ad, compression="gzip")
     print(f"[DONE] saved: {args.out_h5ad}  (shape={P.shape})")
+
+    # Retrieval-strategy ablation (R2, corrected): SPAM's prediction is the model
+    # DECODER OUTPUT, not the retrieved copy. So for each alternative aggregation
+    # strategy we feed its retrieved expression as the gene-token INPUT and run
+    # the same decoder forward, then save the OUTPUT (comparable to the 0.46
+    # headline). celltype_top1's output == args.out_h5ad above.
+    if args.retrieval_ablation and sim_out is not None and sim_out.get("ablation_preds"):
+        stem = os.path.splitext(args.out_h5ad)[0]
+        for strat, strat_expr in sim_out["ablation_preds"].items():
+            if strat == "celltype_top1":
+                continue  # identical to the main output already saved
+            em_t = torch.from_numpy(np.ascontiguousarray(strat_expr, dtype=np.float32)).to(device)
+            preds2 = []
+            with torch.no_grad():
+                for batch_imgs in tqdm(img_loader, desc=f"decode:{strat}", leave=False):
+                    if isinstance(batch_imgs, dict):
+                        images = batch_imgs["image"].to(device); idxs = batch_imgs["idx"].to(device).long()
+                    else:
+                        images, idxs = batch_imgs; images = images.to(device); idxs = idxs.to(device).long()
+                    batch = {"image": images, "expr": em_t[idxs], "idx": idxs}
+                    with torch.autocast(device_type="cuda", dtype=amp_dtype,
+                                        enabled=(device.type == "cuda" and args.amp)):
+                        mu, theta, pi = model(batch, spot_feat_in, edge_index, edge_weight, return_attn=False)
+                    preds2.append(torch.log1p(torch.clamp(mu, min=0.0)).detach().cpu())
+            P2 = torch.cat(preds2, dim=0).numpy()
+            rec2 = ad.AnnData(X=P2, obs=eval_adata.obs.copy(), var=eval_adata.var.copy())
+            outp = f"{stem}_out_{strat}.h5ad"
+            rec2.write(outp, compression="gzip")
+            print(f"[retrieval-ablation] decoder output {strat} -> {outp}  (shape={P2.shape})")
+        print("===== retrieval-ablation decoder outputs DONE =====")
 
 
 if __name__ == "__main__":

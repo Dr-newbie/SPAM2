@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.ipynb_checkpoints/
+
+# Model checkpoints / large binaries (host externally: Zenodo / GitHub Releases)
+*.pt
+*.pth
+*.ckpt
+*.h5ad
+*.npz
+*.npy
+
+# Logs / caches
+*.log
+full_log.txt
+wandb/
+.cache/
+
+# Data
+*.zarr/
+*.tif
+*.tiff
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

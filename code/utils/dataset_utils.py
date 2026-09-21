@@ -14,6 +14,11 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms as T
 
 import scanpy as sc
+
+try:
+    from utils.gene_panel import drop_control_probes
+except ModuleNotFoundError:
+    from code.utils.gene_panel import drop_control_probes
 import anndata as ad
 
 
@@ -57,6 +62,7 @@ def load_h5ad_with_preproc(
     target_sum: float = 1e4,
     x_key: str = "x_centroid",
     y_key: str = "y_centroid",
+    drop_controls: bool = True,
 ) -> ad.AnnData:
     """
     - HVG 사용 시: seurat_v3로 상위 n_top_genes 선정
@@ -66,6 +72,28 @@ def load_h5ad_with_preproc(
     _check_file(h5ad_path)
     adata = sc.read_h5ad(h5ad_path)
     adata.var_names_make_unique()
+
+    # Drop Xenium control probes before anything else. They are near-zero by
+    # design (0.07% of counts on the breast panel), are not valid ZINB targets,
+    # and would otherwise contribute 228 unpredictable columns to every
+    # per-gene metric average. Doing it here also means the size factor below
+    # measures transcript depth, not depth plus control noise.
+    if drop_controls:
+        adata = drop_control_probes(adata, verbose=True)
+
+    # Keep the observed integer counts and the per-cell library size BEFORE
+    # normalization. The ZINB likelihood is defined on counts, and
+    # normalize_total() is destructive: log1p can be inverted with expm1 but the
+    # library-size division cannot, so a loss computed after this point can
+    # never recover sequencing depth. adata.X stays log1p(CP10K) for the
+    # encoders; the loss reads adata.layers["counts"] and obs["size_factor"].
+    _counts = adata.X.copy()
+    _lib = np.asarray(_counts.sum(axis=1)).ravel().astype(np.float64)
+    adata.layers["counts"] = _counts
+    # s_i = (sum_g x_ig) / target_sum, so that s_i * mu_hat lives on the count
+    # scale while mu_hat stays on the normalized scale the decoder was fit to.
+    adata.obs["size_factor"] = np.maximum(_lib, 1.0) / float(target_sum)
+    adata.obs["library_size"] = _lib
 
     sc.pp.normalize_total(adata, target_sum=target_sum)
     if log1p:
@@ -185,7 +213,10 @@ class SpotImageGeneDataset(Dataset):
         self.image_transform = image_transform if image_transform is not None else _DEFAULT_IMG_TF
 
         obs_index = set(adata.obs_names.astype(str).tolist())
-        keep = self.map_df["spot_id"].astype(str).isin(obs_index)
+        # NOTE: pd.Series.isin segfaults on >1M-row object series in this env
+        # (broken pandas C hashtable ABI); plain-Python membership is safe.
+        ids = self.map_df["spot_id"].astype(str).to_numpy()
+        keep = np.fromiter((i in obs_index for i in ids), dtype=bool, count=len(ids))
         self.map_df = self.map_df[keep].reset_index(drop=True)
 
         if gene_names is None:
@@ -203,6 +234,15 @@ class SpotImageGeneDataset(Dataset):
             raise KeyError(f"Some genes not found in adata.var_names: {missing[:10]} ...")
 
         self.gene_dim = len(self.gene_names)
+
+        # Count-scale targets for the ZINB likelihood, kept alongside the
+        # log1p(CP10K) encoder input. Absent only for AnnData written before
+        # load_h5ad_with_preproc started preserving them.
+        self.has_counts = "counts" in getattr(adata, "layers", {})
+        self._size_factor = (
+            adata.obs["size_factor"].to_numpy().astype(np.float32)
+            if "size_factor" in adata.obs.columns else None
+        )
 
     def __len__(self):
         return len(self.map_df)
@@ -222,6 +262,43 @@ class SpotImageGeneDataset(Dataset):
         gene_vec = torch.from_numpy(np.asarray(x).reshape(-1).astype(np.float32))  # (G,)
 
         return img_t, gene_vec, sid  # (기존 형식 유지)
+
+    # ------------------------------------------------------------------
+    # Count-scale targets, aligned to map_df order.
+    #
+    # Returned as whole-section arrays rather than per-item tensors so the
+    # __getitem__ contract (img, gene, sid) stays intact for every existing
+    # caller; the training loop indexes these with the batch's node index.
+    # ------------------------------------------------------------------
+    def counts_matrix(self) -> np.ndarray:
+        """(N, G) observed integer counts in map_df order."""
+        if not self.has_counts:
+            raise RuntimeError(
+                "adata has no 'counts' layer. Reload through "
+                "load_h5ad_with_preproc(), which preserves raw counts before "
+                "normalize_total()."
+            )
+        rows = self.adata.obs_names.get_indexer(self.map_df["spot_id"].astype(str))
+        if np.any(rows < 0):
+            raise KeyError("some spot_ids are missing from adata.obs_names")
+        x = self.adata.layers["counts"][rows][:, self._gene_index]
+        if hasattr(x, "toarray"):
+            x = x.toarray()
+        return np.asarray(x, dtype=np.float32)
+
+    def size_factors(self) -> np.ndarray:
+        """
+        (N,) per-cell size factor s_i = library_size / target_sum, in map_df
+        order. Computed on the full panel before gene selection, so it measures
+        sequencing depth rather than the depth of the retained genes.
+        """
+        rows = self.adata.obs_names.get_indexer(self.map_df["spot_id"].astype(str))
+        if self._size_factor is None:
+            raise RuntimeError(
+                "adata.obs has no 'size_factor'. Reload through "
+                "load_h5ad_with_preproc()."
+            )
+        return self._size_factor[rows].astype(np.float32)
 
 
 # ----------------------------

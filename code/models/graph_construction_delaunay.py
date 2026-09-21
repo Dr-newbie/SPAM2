@@ -144,7 +144,3 @@ def build_delaunay_graph(coords: np.ndarray,
         edge_index, edge_weight = add_self_loops(edge_index, num_nodes=n)
 
     return edge_index, edge_weight
-
-
-# Drop-in compatibility with existing call sites.
-build_knn_graph = build_delaunay_graph

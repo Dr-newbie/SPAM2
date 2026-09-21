@@ -52,8 +52,18 @@ class InferenceEncoder(torch.nn.Module):
             return int(e.num_features)
         # CONCH/TITAN (attentional pooler): trunk.embed_dim 또는 attentional pooler의 output
         if hasattr(e, "trunk") and hasattr(e.trunk, "embed_dim"):
-            # TITAN/CONCH의 경우 attentional pooler가 있으면 768로 변환
-            if hasattr(e, "attentional_pooler"):
+            # An attentional pooler may re-project the trunk output to a different dim;
+            # derive the real output dim instead of hard-coding a single variant's value.
+            ap = getattr(e, "attentional_pooler", None)
+            if ap is not None:
+                for attr in ("embed_dim", "output_dim", "out_features", "d_model"):
+                    if hasattr(ap, attr):
+                        return int(getattr(ap, attr))
+                proj = getattr(ap, "proj", None)
+                if isinstance(proj, torch.nn.Linear):
+                    return int(proj.out_features)
+                print("[WARN] attentional_pooler output dim not introspectable; "
+                      "falling back to 768 (CONCH v1.5 default).")
                 return 768  # TITAN CONCH v1.5 pooled output dimension
             return int(e.trunk.embed_dim)
         # CONCH visual_encoder: visual_model의 embed_dim
@@ -154,6 +164,12 @@ class UNIInferenceEncoder(InferenceEncoder):
         from timm.data import resolve_data_config
         from timm.data.transforms_factory import create_transform
         
+        # Several callers hardcode weights_path=None, which forces a HuggingFace
+        # download that fails on this machine. Fall back to a local copy when
+        # SPAM_UNI_WEIGHTS is set; unset, behaviour is unchanged.
+        if weights_path is None:
+            weights_path = os.environ.get("SPAM_UNI_WEIGHTS") or None
+
         try:
             if weights_path is None:
                 model = timm.create_model("hf-hub:MahmoodLab/uni", pretrained=True, **timm_kwargs)
@@ -167,6 +183,17 @@ class UNIInferenceEncoder(InferenceEncoder):
             traceback.print_exc()
             raise Exception("Failed to download UNI model, make sure that you were granted access and that you correctly registered your token")
         
+        # Backprop through all 24 ViT-L blocks at batch 128 exhausts a 96 GB card
+        # during finetuning (OOM ~step 345 of epoch 1). Gradient checkpointing
+        # trades ~30% step time for a large drop in activation memory, which
+        # keeps batch_size at the configured value instead of forcing it down.
+        if os.environ.get("SPAM_GRAD_CHECKPOINT", "").strip() in ("1", "true", "True"):
+            try:
+                model.set_grad_checkpointing(True)
+                print("[UNI] gradient checkpointing enabled")
+            except Exception as e:
+                print(f"[UNI] could not enable gradient checkpointing: {type(e).__name__}: {e}")
+
         eval_transform = create_transform(**resolve_data_config(model.pretrained_cfg, model=model))
         precision = torch.float16
         return model, eval_transform, precision
@@ -367,9 +394,16 @@ class TiTanEncoder(InferenceEncoder):
         original_device = x.device
         x_cpu = x.cpu().float()  # CPU로 이동하고 float32 변환
         
-        # 모델의 모든 파라미터가 CPU에 있는지 확인
-        self.encoder = self.encoder.cpu()
-        
+        # Defensive: an outer .to(device) may have moved the encoder off CPU,
+        # which re-triggers the CUDA einsum bug. Only move when actually needed
+        # (avoids a redundant .cpu()/reassignment on every forward).
+        try:
+            enc_dev = next(self.encoder.parameters()).device.type
+        except StopIteration:
+            enc_dev = "cpu"
+        if enc_dev != "cpu":
+            self.encoder = self.encoder.cpu()
+
         embedding = self.encoder(x_cpu)
         
         # 결과를 원래 device로 되돌림
