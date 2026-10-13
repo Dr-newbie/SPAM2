@@ -209,6 +209,19 @@ You can check the tutorial notebook in tutorial.ipynb file
 
 
 --- 
+## 🧪 Baseline benchmark harness
+
+The unified harness used to train and evaluate **all baselines reported in the paper**
+(ST-Net, DeepSpaCE, DeepPT, BLEEP, STMCL, EGNv2) lives in [`baselines/`](baselines/README.md).
+It includes:
+
+- `clone_repos.sh` — clones each upstream implementation at the **pinned commit** used for the manuscript
+- `run_matrix.py` / `run_all.sh` — one-command training/evaluation of every method on every dataset
+- per-run **`config.json`** files recording the exact configuration of every reported run
+- the **UNI-backbone control** (`--uni_encoder`) used for Table 5
+
+See [`baselines/README.md`](baselines/README.md) for setup, commands, and configuration details.
+
 ## 📚 Citation
 If you use SPAM in your research, please cite:
    > Jaeyun Park, Dongsin Kim, Minsik Oh*.

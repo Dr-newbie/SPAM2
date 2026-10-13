@@ -1,0 +1,122 @@
+{
+  "_comment": [
+    "Paired Xenium sections: train on one, score the other. Pairs were confirmed by",
+    "gene-panel overlap and, for breast, by cross-checking patch-CSV coordinates",
+    "against adata.obsm['spatial'].",
+    "NOTE: the 541-gene breast panel is 313 measured genes + 228 negative control",
+    "probes (NegControlProbe/NegControlCodeword/BLANK). Control probes are near-zero",
+    "by construction and dilute any per-gene metric averaged over all 541 columns."
+  ],
+  "_root": "/path/to/SPAM_data",
+  "_patch_root": "/path/to/SPAM_data/contrast_test/expression",
+  "datasets": {
+    "skin": {
+      "tissue": "Skin (non-diseased)",
+      "train": {
+        "h5ad": "h5ads/human_skin1.h5ad",
+        "csv": "contrast_test/expression/human_skin1_patches_256/spot_patch_map_256.csv"
+      },
+      "test": {
+        "h5ad": "h5ads/human_skin2.h5ad",
+        "csv": "contrast_test/expression/human_skin2_patches_256/spot_patch_map_256.csv"
+      },
+      "n_train_cells": 68476,
+      "n_test_cells": 90106,
+      "shared_genes": 377,
+      "relation": "two sections of the same sample"
+    },
+    "tonsil": {
+      "tissue": "Tonsil",
+      "train": {
+        "h5ad": "h5ads/human_reactive_follicular.h5ad",
+        "csv": "contrast_test/expression/human_reactive_follicular_patches_256/spot_patch_map_256.csv"
+      },
+      "test": {
+        "h5ad": "h5ads/human_follicular_lymphoid.h5ad",
+        "csv": "contrast_test/expression/human_follicular_lymphoid_patches_256/spot_patch_map_256.csv"
+      },
+      "n_train_cells": 1349620,
+      "n_test_cells": 864388,
+      "shared_genes": 377,
+      "relation": "same platform, different donor"
+    },
+    "skin_cancer": {
+      "tissue": "Skin cancer (melanoma)",
+      "train": {
+        "h5ad": "h5ads/skin_melanoma_base.h5ad",
+        "csv": "contrast_test/expression/human_skin_melanoma_base_patches_256/spot_patch_map_256.csv"
+      },
+      "test": {
+        "h5ad": "h5ads/skin_melanoma.h5ad",
+        "csv": "contrast_test/expression/human_skin_melanoma_patches_256/spot_patch_map_256.csv"
+      },
+      "n_train_cells": 106980,
+      "n_test_cells": 87499,
+      "shared_genes": 282,
+      "relation": "different study, different panel (282 of 382 shared)"
+    },
+    "lung": {
+      "tissue": "Lung cancer",
+      "train": {
+        "h5ad": "h5ads/human_lung_addon.h5ad",
+        "csv": "contrast_test/expression/human_lung_addon_patches_256/spot_patch_map_256.csv"
+      },
+      "test": {
+        "h5ad": "h5ads/human_lung_5K.h5ad",
+        "csv": "contrast_test/expression/human_lung_5K_patches_256/spot_patch_map_256.csv"
+      },
+      "n_train_cells": 161000,
+      "n_test_cells": 278328,
+      "shared_genes": 332,
+      "relation": "different study, different panel (480 vs 5001)"
+    },
+    "ovarian": {
+      "tissue": "Ovarian cancer",
+      "train": {
+        "h5ad": "h5ads/spampair_ovarian_train.h5ad",
+        "csv": "contrast_test/expression/ov_cancer_patches_256/spot_patch_map_256.csv"
+      },
+      "test": {
+        "h5ad": "h5ads/spampair_ovarian_test.h5ad",
+        "csv": "contrast_test/expression/ov_adenocarcinoma_patches_256/spot_patch_map_256.csv"
+      },
+      "n_train_cells": 407124,
+      "n_test_cells": 1157659,
+      "shared_genes": 1833,
+      "relation": "different study, FF vs FFPE",
+      "_note": "raw ov files carry NaN from panel-merge; spampair files are the clean shared-panel build (2026-08-27)"
+    },
+    "breast": {
+      "tissue": "Breast cancer",
+      "train": {
+        "h5ad": "Breast2_outs/breast2_leiden.h5ad",
+        "csv": "contrast_test/expression/breast2_patches_256/spot_patch_map_256.csv"
+      },
+      "test": {
+        "h5ad": "h5ads/breast1_rep1_counts.h5ad",
+        "csv": "contrast_test/expression/breast1_patches_256/spot_patch_map_256.csv"
+      },
+      "n_train_cells": 118752,
+      "n_test_cells": 167780,
+      "shared_genes": 541,
+      "relation": "two adjacent sections of the same block (Rep2 -> Rep1)",
+      "note": "Test h5ad rebuilt as h5ads/breast1_rep1_counts.h5ad: the released merged_with_celltype_symbol_SPAM.h5ad stores log1p(CP10K) with no raw counts, and its obs_names are 0-based while the patch CSV is 1-based - using it as shipped shifts every cell by one. Counts come from xenium_rep1_io/data/xenium/outs/cell_feature_matrix.h5."
+    },
+    "ovarian_swap": {
+      "tissue": "Ovarian cancer",
+      "train": {
+        "h5ad": "h5ads/spampair_ovarian_test.h5ad",
+        "csv": "contrast_test/expression/ov_adenocarcinoma_patches_256/spot_patch_map_256.csv"
+      },
+      "test": {
+        "h5ad": "h5ads/spampair_ovarian_train.h5ad",
+        "csv": "contrast_test/expression/ov_cancer_patches_256/spot_patch_map_256.csv"
+      },
+      "n_train_cells": 1157659,
+      "n_test_cells": 407124,
+      "shared_genes": 1833,
+      "relation": "different study, FF vs FFPE",
+      "_note": "CORRECTED orientation: train=adenocarcinoma, test=ov_cancer (has GT Cluster). Matches manuscript."
+    }
+  }
+}

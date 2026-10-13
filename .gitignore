@@ -28,3 +28,7 @@ wandb/
 .DS_Store
 .vscode/
 .idea/
+
+# Baseline harness: third-party clones and run outputs
+baselines/repos/
+baselines/runs/
