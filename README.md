@@ -1,5 +1,7 @@
 # 🐽 SPAM : Spatial transcriptomics Predictor with self-supervised Alignment of Multimodalities
-[![License: MIT](https://shields.io)](https://opensource.org)
+[![License: MIT](https://shields.io)](./LICENSE)
+![Journal](https://shields.io)
+
 
 > **Context-aware spatial gene expression prediction from histology with multimodal self-supervised learning**
 >
